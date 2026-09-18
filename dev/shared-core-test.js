@@ -161,6 +161,40 @@ test("a refused address is dropped instead of the nodes it was tried on",()=>{
   assert.equal(bans.allows(akamaiUrl("cosovbv")),true);assert.equal(bans.allows(at(lacking,"akam")),true);
 });
 
+test("a node that delivers one address keeps being used after refusing another that other nodes serve",()=>{
+  const {cdn}=load();
+  const banned=[];
+  const bans=cdn.createBanList({onBan:(host,_count,_error,kind)=>banned.push(kind)});
+  const mirror="upos-sz-mirroraliov.bilivideo.com";
+  const at=(host,os)=>akamaiUrl(os).replace(AKAMAI,host);
+  // The mirror serves both addresses, akamaized.net only one of them.
+  bans.success(at(mirror,"cosovbv"));bans.success(at(mirror,"akam"));bans.success(akamaiUrl("akam"));
+  bans.record(akamaiUrl("cosovbv"),0,refused);bans.record(akamaiUrl("cosovbv"),0,refused);
+  assert.equal(bans.allows(akamaiUrl("cosovbv")),false,"that address is not asked of that node again");
+  assert.equal(bans.allows(akamaiUrl("akam")),true,"the node keeps its working address");
+  assert.equal(bans.allows(at(mirror,"cosovbv")),true,"the address stays in use where it works");
+  assert.deepEqual(Array.from(bans.hosts()),[]);assert.deepEqual(banned,["address"]);
+  const resolver=cdn.createResolver({baseUrl:akamaiUrl("cosovbv"),backupUrl:[akamaiUrl("akam")]},()=> "overseas",bans);
+  assert.ok(Array.from(resolver.urls()).includes(akamaiUrl("akam")));assert.ok(!Array.from(resolver.urls()).includes(akamaiUrl("cosovbv")));
+  assert.ok(Array.from(resolver.status()).every(item=>item.state!=="banned"));
+  // On a node with two addresses, the one that has delivered is chosen first.
+  assert.equal(resolver.pick([at("upos-sz-mirrorcosov.bilivideo.com","cosovbv").replace("os=cosovbv","os=other"),at("upos-sz-mirrorcosov.bilivideo.com","akam")],new Set(),65536),at("upos-sz-mirrorcosov.bilivideo.com","akam"));
+});
+
+test("pieces grow with the speed of the fastest node, so a far but fast node is not judged by its round trip",()=>{
+  const {cdn}=load();
+  const nodeStats=cdn.createNodeStats();
+  const resolver=cdn.createResolver({baseUrl:mediaUrl("upos-sz-mirrorcosov.bilivideo.com")},()=> "overseas",null,nodeStats);
+  assert.equal(resolver.pieceBytes(65536),65536,"nothing measured yet: the old 64 KiB");
+  const far=mediaUrl("upos-sz-mirrorcosov.bilivideo.com"),near=mediaUrl("upos-sz-mirroraliov.bilivideo.com");
+  nodeStats.begin(far);nodeStats.firstByte(far,370);nodeStats.body(far,1024*1024,300);nodeStats.end(far,true);
+  nodeStats.begin(near);nodeStats.firstByte(near,40);nodeStats.body(near,65536,160);nodeStats.end(near,true);
+  const size=resolver.pieceBytes(65536);
+  assert.ok(size>=400*1024&&size<=512*1024,`piece size ${size}`);
+  assert.equal(resolver.pick([near,far],new Set(),size),far,"a piece of that size finishes first on the fast node despite its round trip");
+  assert.equal(resolver.pick([near,far],new Set(),65536),near,"for 64 KiB the round trip decided");
+});
+
 test("an akamaized.net-only video downloads in mainland mode and stops asking for the refused address",{timeout:60000},async()=>{
   const {cdn,idm}=load();
   const asked={cosovbv:0,akam:0};
@@ -177,7 +211,9 @@ test("an akamaized.net-only video downloads in mainland mode and stops asking fo
   assert.equal(meta.bytes.length,1000);
   const range={start:1000,end:1000+1024*1024-1,length:1024*1024};
   assert.equal((await downloader.downloadRange(range,resolver,{parallel:true,kind:"video"})).bytes.length,range.length);
-  assert.equal(bans.allowsAddress(akamaiUrl("cosovbv")),false);assert.deepEqual(Array.from(bans.hosts()),[],"no node is banned for the refused address");
+  // The address that has delivered is asked first on every node, so the refused one may not
+  // even collect the two refusals that drop it. Either way it is given up on at once.
+  assert.ok(asked.cosovbv<=4,`the refused address was asked ${asked.cosovbv} times`);assert.deepEqual(Array.from(bans.hosts()),[],"no node is banned for the refused address");
   const before=asked.cosovbv;
   await downloader.downloadRange(range,resolver,{parallel:true,kind:"video"});
   assert.equal(asked.cosovbv,before,"the refused address gets no new requests");
@@ -226,10 +262,12 @@ test("fast nodes carry most of a video and almost nothing is downloaded twice",{
     assert.ok(first.downloader.duplicateBytes<=network.stats.canceledBytes);
     // After a seek the player starts again with new resolvers. What is known about the nodes
     // is kept, so nothing is raced again and the restart is no slower than the cold start.
-    const racedBefore=network.stats.byHost["cn-hk-eq-01-01.bilivideo.com"].requests;
+    const racedBefore=network.stats.byHost["cn-hk-eq-01-01.bilivideo.com"].requests,answeredBefore=network.stats.lengths.length;
+    assert.ok(network.stats.lengths.includes(65536),"the cold start sends the 64 KiB head on its own");
     const second=await watchVideo(lib,network,{representation:{baseUrl:akamaiUrl("akam")},nodeStats,segments:2});
     assert.ok(second.startupMs<=first.startupMs*1.25,`restart ${Math.round(second.startupMs)} ms, cold start ${Math.round(first.startupMs)} ms`);
     assert.ok(network.stats.byHost["cn-hk-eq-01-01.bilivideo.com"].requests-racedBefore<=2,"the slowest node is not raced again");
+    assert.ok(!network.stats.lengths.slice(answeredBefore).includes(65536),"with the nodes known, the restart does not wait for a head piece first");
   }finally{network.stop();}
 });
 

@@ -375,6 +375,8 @@ const chrome = (() => {
   // node refuses. What has delivered data decides it. Refused by a node that serves other
   // addresses, the address is dropped; refused where other nodes serve it, the node is.
   // With neither known yet, the reply counts against nobody until one of them delivers.
+  // A node that delivers one address and refuses another that other nodes do serve loses only
+  // that address: banning the node took away the fastest one of an Akamai-only account.
   function createBanList(options = {}) {
     const limit = Math.max(1, Math.trunc(Number(options.limit)) || 2);
     const emptyReplies = new Map();
@@ -387,8 +389,9 @@ const chrome = (() => {
       const strikes = new Map();
       for (const [key, count] of emptyReplies) {
         const [node, address, refused] = key.split("\n");
-        const blamed = !refused || goodAddresses.has(address) ? `node:${node}`
-          : goodNodes.has(node) ? `address:${address}` : "";
+        const blamed = !refused ? `node:${node}`
+          : goodNodes.has(node) ? (goodAddresses.has(address) ? `pair:${node} ${address}` : `address:${address}`)
+            : goodAddresses.has(address) ? `node:${node}` : "";
         if (blamed) strikes.set(blamed, (strikes.get(blamed) || 0) + count);
       }
       banned = new Set([...strikes].filter(([, count]) => count >= limit).map(([key]) => key));
@@ -421,7 +424,8 @@ const chrome = (() => {
         goodAddresses.add(address);
         judge(url, null);
       },
-      allows: (url) => !banned.has(`node:${hostOf(url)}`) && !banned.has(`address:${addressOf(url)}`),
+      allows: (url) => !banned.has(`node:${hostOf(url)}`) && !banned.has(`address:${addressOf(url)}`) && !banned.has(`pair:${hostOf(url)} ${addressOf(url)}`),
+      delivered: (url) => goodAddresses.has(addressOf(url)),
       allowsNode: (url) => !banned.has(`node:${hostOf(url)}`),
       allowsAddress: (url) => !banned.has(`address:${addressOf(url)}`),
       hosts: () => [...banned].filter((key) => key.startsWith("node:")).map((key) => key.slice(5)),
@@ -492,13 +496,32 @@ const chrome = (() => {
         if (item.receiving > 0) item.limit = Math.min(item.limit, item.receiving);
         else item.ttfbMs = blend(item.ttfbMs, waitedMs);
       },
+      // The other copy of the piece won before this node had sent anything. How long it had
+      // been waiting is the least its first byte would have taken.
+      outrun(url, waitedMs) {
+        const item = node(url);
+        if (waitedMs > item.ttfbMs) item.ttfbMs = blend(item.ttfbMs, waitedMs);
+      },
+      // The other copy won while this node was still sending. A transfer that is outrun never
+      // reaches body(), so a node that answers at once and then trickles would keep the speed
+      // it showed on a part of the file it had ready, and keep getting most of the pieces.
+      crawl(url, bytes, milliseconds) {
+        const item = node(url);
+        const bps = bytes / Math.max(0.02, milliseconds / 1000);
+        if (milliseconds >= 300 && bps < item.bps) item.bps = blend(item.bps, bps);
+      },
       full: (url) => node(url).inflight >= node(url).limit,
       // A node that is sending other pieces is alive, whatever happened to this one.
       busy: (url) => node(url).receiving > 0,
       known: (url) => node(url).bps > 0,
       inflight: (url) => node(url).inflight,
       ttfbMs: (url) => node(url).ttfbMs,
-      expectedMs
+      expectedMs,
+      bps: (url) => node(url).bps,
+      dump: () => Object.fromEntries([...nodes].map(([host, item]) => [host, {
+        ttfbMs: Math.round(item.ttfbMs), kbps: Math.round(item.bps / 1024), load: Math.round(item.load * 10) / 10,
+        limit: Number.isFinite(item.limit) ? item.limit : null, inflight: item.inflight
+      }]))
     });
   }
 
@@ -601,9 +624,13 @@ const chrome = (() => {
     }
 
     // The address expected to deliver a piece of this size first, counting what each node is
-    // already carrying. A node nothing is known about is tried with one piece at a time, but
-    // not while the player is waiting for its first frame (`explore` false).
-    function pick(candidates, tried, pieceBytes, explore = true) {
+    // already carrying. A node nothing is known about is tried with one piece at a time.
+    //
+    // `hurry` is set while the player has next to nothing buffered. One measurement must not
+    // decide where a whole segment goes then: a node that answered the first request of a
+    // video at once may need seconds for a part of the file it has not served lately. So the
+    // pieces are spread, unknown nodes take their share, and no node gets more than half.
+    function pick(candidates, tried, pieceBytes, hurry = false) {
       const now = Date.now();
       const untried = candidates.filter((url) => !tried.has(url));
       const open = untried.filter((url) => allows(url));
@@ -611,13 +638,18 @@ const chrome = (() => {
       const pool = ready.length ? ready : open.length ? open : untried;
       const known = pool.map((url) => nodeStats.expectedMs(url, pieceBytes)).filter((value) => value !== null);
       const best = known.length ? Math.min(...known) : 0;
+      const hosts = new Set(pool.map(hostOf));
+      const carried = [...hosts].reduce((sum, host) => sum + nodeStats.inflight(`https://${host}/`), 0);
       let chosen = null;
       let chosenCost = Infinity;
       for (const url of pool) {
         const inflight = nodeStats.inflight(url);
         const expected = nodeStats.expectedMs(url, pieceBytes);
         let cost = expected;
-        if (expected === null) cost = !known.length ? inflight : explore && !inflight ? best * 0.9 : best * 4 + inflight;
+        if (expected === null) cost = !known.length ? inflight : hurry ? best * 2 * (inflight + 1) : !inflight ? best * 0.9 : best * 4 + inflight;
+        if (hurry && hosts.size > 2 && inflight >= 2 && inflight * 2 > carried) cost += 1e5;
+        // The addresses of one node cost the same; the one that has delivered goes first.
+        if (bans?.delivered && !bans.delivered(url)) cost += 1;
         if (nodeStats.full(url)) cost += 1e6;
         if (cost < chosenCost) {
           chosen = url;
@@ -625,6 +657,15 @@ const chrome = (() => {
         }
       }
       return chosen;
+    }
+
+    // Small pieces cost a round trip each, and from far away that is most of their time: 64 KiB
+    // from a node 300 ms away that sends 3 MB/s is 300 ms of waiting for 20 ms of data, which
+    // made the nearest node look best however slow it was. A piece is sized to keep the
+    // fastest usable node sending for about 150 ms.
+    function pieceBytes(minimum) {
+      const fastest = Math.max(0, ...urls().map((url) => nodeStats.bps(url)));
+      return Math.max(minimum, Math.min(512 * 1024, Math.round(fastest * 0.15)));
     }
 
     // `busy` is a first byte that never came from a node that was sending other pieces at the
@@ -659,7 +700,7 @@ const chrome = (() => {
     }
 
     const allows = (url) => !bans || bans.allows(url);
-    return Object.freeze({ allows, failure, nodes: nodeStats, ordered, pick, rangeCandidates, rescueCandidates, startupCandidates, status, success, urls });
+    return Object.freeze({ allows, failure, nodes: nodeStats, ordered, pick, pieceBytes, rangeCandidates, rescueCandidates, startupCandidates, status, success, urls });
   }
 
   root.__BILI_CDN_RESOLVER_FACTORY__ = Object.freeze({
@@ -869,6 +910,13 @@ const chrome = (() => {
     const semaphore = new Semaphore(core.normalizeSettings(getSettings()).concurrency);
     // duplicateBytes is what arrived on a second copy of a piece before the other copy won.
     const counters = { requests: 0, copies: 0, bytes: 0, duplicateBytes: 0 };
+    // The last requests, for the diagnostic report: when, which node, how long until the first
+    // byte and until the end, and how it ended.
+    const recent = [];
+    function remember(entry) {
+      recent.push(entry);
+      if (recent.length > 400) recent.shift();
+    }
 
     async function readBody(response, controller, transferId, settings, received) {
       if (!response.body?.getReader) {
@@ -963,13 +1011,18 @@ const chrome = (() => {
         nodes?.body(url, bytes.byteLength, performance.now() - firstByteAt);
         resolver.success(url, bytes.byteLength / seconds);
         counters.bytes += bytes.byteLength;
+        remember({ at: Math.round(startedAt), kind, node: new URL(url).hostname, bytes: piece.length, firstByteMs: Math.round(firstByteAt - startedAt), ms: Math.round(performance.now() - startedAt), end: "ok" });
         onTransfer({ phase: "done", id: transferId });
         return { bytes, total: contentRange.total, url };
       } catch (error) {
+        const outrun = controller.signal.reason?.message === DUPLICATE_CANCELED;
         const silent = !receiving && error?.name === "TimeoutError";
         const busy = silent && Boolean(nodes?.busy(url));
         if (silent) nodes?.silent(url, performance.now() - startedAt);
-        if (error?.message === DUPLICATE_CANCELED) counters.duplicateBytes += received.bytes;
+        if (outrun) counters.duplicateBytes += received.bytes;
+        if (outrun && !receiving) nodes?.outrun?.(url, performance.now() - startedAt);
+        if (outrun && receiving) nodes?.crawl?.(url, received.bytes, performance.now() - received.firstByteAt);
+        remember({ at: Math.round(startedAt), kind, node: new URL(url).hostname, bytes: piece.length, firstByteMs: received.firstByteAt ? Math.round(received.firstByteAt - startedAt) : null, ms: Math.round(performance.now() - startedAt), end: outrun ? "other copy won" : String(error?.message || error).slice(0, 60) });
         // Received bytes tell a dead node (0 KiB) apart from a transfer that stalled midway.
         resolver.failure(url, error, received.bytes, busy);
         const canceled = error?.name === "AbortError";
@@ -1040,15 +1093,18 @@ const chrome = (() => {
           const elapsed = now - watch.startedAt;
           if (!watch.firstByteAt) {
             const usual = nodes?.ttfbMs(watch.url) || 0;
-            const budget = usual
-              ? Math.min(3000, Math.max(startup ? 400 : 600, usual * 3))
-              : startup ? Math.min(600, settings.hedgeDelayMs) : settings.hedgeDelayMs;
+            // With next to nothing buffered a second copy costs less than the wait: a node can
+            // take seconds over a part of the file it has not served lately.
+            const budget = startup
+              ? (usual ? Math.min(600, Math.max(250, usual * 2)) : 250)
+              : usual ? Math.min(3000, Math.max(600, usual * 3)) : settings.hedgeDelayMs;
             if (elapsed >= budget) done();
             return;
           }
-          if (now - watch.lastByteAt >= 1500) return done();
+          if (now - watch.lastByteAt >= (startup ? 1000 : 1500)) return done();
           const expected = nodes?.expectedMs(watch.url, piece.length) || settings.hedgeDelayMs;
-          if (elapsed >= Math.max(settings.hedgeDelayMs, expected * 3) && watch.bytes < piece.length * 0.75) done();
+          const allowed = startup ? Math.max(400, expected * 2) : Math.max(settings.hedgeDelayMs, expected * 3);
+          if (elapsed >= allowed && watch.bytes < piece.length * 0.75) done();
         }
         watch.wake = done;
         if (signal.aborted) done();
@@ -1081,7 +1137,7 @@ const chrome = (() => {
           if (tried.size >= limit) return null;
           const untried = candidates.filter((url) => !tried.has(url));
           const url = typeof resolver.pick === "function"
-            ? resolver.pick(candidates, tried, piece.length, !startup)
+            ? resolver.pick(candidates, tried, piece.length, startup)
             : untried.find(allowed) || untried[0];
           if (url) tried.add(url);
           return url || null;
@@ -1092,19 +1148,21 @@ const chrome = (() => {
         while (tried.size < limit) {
           if (signal?.aborted) throw abortError(signal.reason);
           const before = tried.size;
-          const controllers = Array.from({ length: race ? limit : 2 }, () => new AbortController());
+          const controllers = Array.from({ length: race ? limit : startup ? 3 : 2 }, () => new AbortController());
           const cancelAll = () => controllers.forEach((controller) => controller.abort(abortError(signal?.reason)));
           if (signal?.aborted) cancelAll();
           else signal?.addEventListener("abort", cancelAll, { once: true });
-          const watch = { bytes: 0 };
+          // Each copy is watched by the next one: with little buffered, a second copy that
+          // trickles like the first gets a third.
+          const watches = controllers.map(() => ({ bytes: 0 }));
           const attempts = controllers.map((controller, copy) => (async () => {
             if (copy && !race) {
-              await overdue(watch, piece, resolver, settings, startup, controller.signal);
+              await overdue(watches[copy - 1], piece, resolver, settings, startup, controller.signal);
               if (controller.signal.aborted) throw abortError(controller.signal.reason);
-              if (!watch.failed) counters.copies += 1;
+              if (!watches[copy - 1].failed) counters.copies += 1;
             }
-            const copyPriority = copy && !race ? () => (!urgent || urgent() ? priority + 20 : priority - 100) : priority;
-            return attempt(piece, choose, controller.signal, kind, resolver, copyPriority, copy ? null : watch);
+            const copyPriority = copy && !race ? () => (startup || !urgent || urgent() ? priority + 20 : priority - 100) : priority;
+            return attempt(piece, choose, controller.signal, kind, resolver, copyPriority, race ? null : watches[copy]);
           })());
           const cancelCopies = () => {
             signal?.removeEventListener("abort", cancelAll);
@@ -1253,7 +1311,10 @@ const chrome = (() => {
         end: range.start + headLength - 1,
         length: headLength
       };
-      const headResult = await downloadPiece(
+      // The head goes first and alone so that every node is raced once. With the nodes known
+      // already it is only one more round trip before the rest may start, so it is left out.
+      const warm = candidateUrls.some((url) => resolver.nodes?.known(url));
+      const headResult = warm ? null : await downloadPiece(
         head,
         resolver,
         options.signal,
@@ -1262,8 +1323,8 @@ const chrome = (() => {
         "probe",
         220
       );
-      await options.onOrderedChunk(headResult.bytes, head);
-      if (head.end >= range.end) {
+      if (headResult) await options.onOrderedChunk(headResult.bytes, head);
+      if (headResult && head.end >= range.end) {
         options.onStartupScheduled?.();
         return {
           bytes: null,
@@ -1282,11 +1343,11 @@ const chrome = (() => {
         ? audioBudget
         : Math.max(1, mediaBudget - audioBudget);
       const pieces = core.splitRange(
-        head.end + 1,
+        headResult ? head.end + 1 : range.start,
         range.end,
         pieceBudget,
         settings.minChunkBytes
-      ).map((piece, index) => ({ ...piece, index: index + 1 }));
+      ).map((piece, index) => ({ ...piece, index: index + (headResult ? 1 : 0) }));
       const ordered = new Array(pieces.length);
       const progress = trackPieces(pieces.length);
       let nextOrderedIndex = 0;
@@ -1308,7 +1369,7 @@ const chrome = (() => {
           resolver,
           options.signal,
           options.kind || "media",
-          [headResult.url],
+          headResult ? [headResult.url] : candidateUrls,
           true,
           120 - Math.min(30, piece.index),
           () => progress.urgent(orderedIndex)
@@ -1321,15 +1382,16 @@ const chrome = (() => {
       options.onStartupScheduled?.();
       const results = await Promise.all(pendingPieces);
       await flushOperation;
-      const totals = [headResult, ...results].map((item) => item.total).filter(Number.isSafeInteger);
+      const parts = [headResult, ...results].filter(Boolean);
+      const totals = parts.map((item) => item.total).filter(Number.isSafeInteger);
       if (totals.length && totals.some((value) => value !== totals[0])) throw new Error("不同 CDN 返回的文件总长度不一致");
       return {
         bytes: null,
         byteLength: range.length,
-        pieceCount: pieces.length + 1,
+        pieceCount: parts.length,
         streamed: true,
         total: totals[0] || null,
-        hosts: [...new Set([headResult, ...results].map((item) => new URL(item.url).hostname))]
+        hosts: [...new Set(parts.map((item) => new URL(item.url).hostname))]
       };
     }
 
@@ -1362,7 +1424,13 @@ const chrome = (() => {
         range.start,
         range.end,
         pieceConcurrency,
-        parallel ? settings.minChunkBytes : Number.MAX_SAFE_INTEGER
+        // Right after a seek every node is slow over a part of the file it has not served
+        // lately, each in its own way: one takes a second or more for the first byte, another
+        // answers at once and then trickles. Many small requests get through that best. Once a
+        // few segments are buffered, larger pieces save round trips and requests.
+        !parallel ? Number.MAX_SAFE_INTEGER
+          : options.hurry === true ? settings.minChunkBytes
+            : resolver.pieceBytes?.(settings.minChunkBytes) || settings.minChunkBytes
       );
       const progressive = typeof options.onOrderedChunk === "function";
       const progress = trackPieces(pieces.length);
@@ -1387,7 +1455,7 @@ const chrome = (() => {
           options.signal,
           options.kind || "media",
           preferredUrls,
-          options.startup === true,
+          options.startup === true || options.hurry === true,
           basePriority - Math.min(20, piece.index),
           () => progress.urgent(piece.index)
         );
@@ -1411,7 +1479,7 @@ const chrome = (() => {
       };
     }
 
-    return Object.freeze({ downloadRange, stats: () => ({ ...counters }) });
+    return Object.freeze({ downloadRange, stats: () => ({ ...counters }), recent: () => recent.slice() });
   }
 
   root.__BILI_IDM_DOWNLOADER_FACTORY__ = Object.freeze({ createDownloader });
