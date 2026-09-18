@@ -165,7 +165,74 @@
     });
   }
 
-  function createResolver(representation, getMode, bans = null) {
+  // What the downloads have measured about each node: how long the first byte takes and how
+  // fast one connection runs. The owner shares one of these between every resolver on the
+  // page, so the audio track, another quality and the session after a seek start from what is
+  // already known instead of trying every node again.
+  function createNodeStats() {
+    const nodes = new Map();
+    const blend = (old, value) => (old ? old * 0.7 + value * 0.3 : value);
+
+    function node(url) {
+      const host = hostOf(url);
+      let item = nodes.get(host);
+      if (!item) {
+        item = { inflight: 0, receiving: 0, ttfbMs: 0, bps: 0, load: 0, limit: Infinity };
+        nodes.set(host, item);
+      }
+      return item;
+    }
+
+    // The speed of one connection was measured while the node carried `load` of them. Beyond
+    // that the node is assumed to share the same total; if it keeps its speed instead, the
+    // next measurements raise `load` and the estimate follows. A node is taken to carry at
+    // least four connections at full speed, which is the reason to split a download at all.
+    function expectedMs(url, pieceBytes) {
+      const item = node(url);
+      if (!item.bps) return null;
+      const width = Math.max(4, item.load);
+      const bps = item.bps * width / Math.max(width, item.inflight + 1);
+      return item.ttfbMs + pieceBytes / bps * 1000;
+    }
+
+    return Object.freeze({
+      begin(url) { node(url).inflight += 1; },
+      firstByte(url, ttfbMs) {
+        const item = node(url);
+        item.receiving += 1;
+        item.ttfbMs = blend(item.ttfbMs, Math.max(1, ttfbMs));
+      },
+      end(url, receiving) {
+        const item = node(url);
+        item.inflight = Math.max(0, item.inflight - 1);
+        if (receiving) item.receiving = Math.max(0, item.receiving - 1);
+      },
+      body(url, bytes, milliseconds) {
+        // An index of a few KB arrives within one packet and says nothing about speed.
+        if (bytes < 32 * 1024) return;
+        const item = node(url);
+        item.bps = blend(item.bps, bytes / Math.max(0.02, milliseconds / 1000));
+        item.load = blend(item.load, item.inflight);
+      },
+      silent(url, waitedMs) {
+        const item = node(url);
+        // No first byte although the node was sending other pieces: the request was waiting
+        // in the browser, which opens six connections to an HTTP/1.1 node. What the node was
+        // carrying at that moment is all it is given from now on.
+        if (item.receiving > 0) item.limit = Math.min(item.limit, item.receiving);
+        else item.ttfbMs = blend(item.ttfbMs, waitedMs);
+      },
+      full: (url) => node(url).inflight >= node(url).limit,
+      // A node that is sending other pieces is alive, whatever happened to this one.
+      busy: (url) => node(url).receiving > 0,
+      known: (url) => node(url).bps > 0,
+      inflight: (url) => node(url).inflight,
+      ttfbMs: (url) => node(url).ttfbMs,
+      expectedMs
+    });
+  }
+
+  function createResolver(representation, getMode, bans = null, nodeStats = createNodeStats()) {
     const health = new Map();
     let cursor = 0;
     let mediaRangeCount = 0;
@@ -263,8 +330,38 @@
       });
     }
 
-    function failure(url, error, receivedBytes = 0) {
-      if (error?.name === "AbortError") return;
+    // The address expected to deliver a piece of this size first, counting what each node is
+    // already carrying. A node nothing is known about is tried with one piece at a time, but
+    // not while the player is waiting for its first frame (`explore` false).
+    function pick(candidates, tried, pieceBytes, explore = true) {
+      const now = Date.now();
+      const untried = candidates.filter((url) => !tried.has(url));
+      const open = untried.filter((url) => allows(url));
+      const ready = (open.length ? open : untried).filter((url) => (health.get(url)?.blockedUntil || 0) <= now);
+      const pool = ready.length ? ready : open.length ? open : untried;
+      const known = pool.map((url) => nodeStats.expectedMs(url, pieceBytes)).filter((value) => value !== null);
+      const best = known.length ? Math.min(...known) : 0;
+      let chosen = null;
+      let chosenCost = Infinity;
+      for (const url of pool) {
+        const inflight = nodeStats.inflight(url);
+        const expected = nodeStats.expectedMs(url, pieceBytes);
+        let cost = expected;
+        if (expected === null) cost = !known.length ? inflight : explore && !inflight ? best * 0.9 : best * 4 + inflight;
+        if (nodeStats.full(url)) cost += 1e6;
+        if (cost < chosenCost) {
+          chosen = url;
+          chosenCost = cost;
+        }
+      }
+      return chosen;
+    }
+
+    // `busy` is a first byte that never came from a node that was sending other pieces at the
+    // time. The request was waiting in the browser (six connections per node over HTTP/1.1),
+    // so it says nothing against the node.
+    function failure(url, error, receivedBytes = 0, busy = false) {
+      if (error?.name === "AbortError" || busy) return;
       bans?.record(url, receivedBytes, error);
       const old = health.get(url) || {};
       const failures = (old.failures || 0) + 1;
@@ -292,7 +389,7 @@
     }
 
     const allows = (url) => !bans || bans.allows(url);
-    return Object.freeze({ allows, failure, ordered, rangeCandidates, rescueCandidates, startupCandidates, status, success, urls });
+    return Object.freeze({ allows, failure, nodes: nodeStats, ordered, pick, rangeCandidates, rescueCandidates, startupCandidates, status, success, urls });
   }
 
   root.__BILI_CDN_RESOLVER_FACTORY__ = Object.freeze({
@@ -300,6 +397,7 @@
     MAINLAND_HOSTS,
     OVERSEAS_HOSTS,
     createBanList,
+    createNodeStats,
     createResolver,
     isAkamaiUrl,
     representationUrls,

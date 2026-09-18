@@ -2,13 +2,17 @@
 // Shared download core. BTR Desktop keeps an identical copy as test/shared.test.cjs.
 const {test}=require("node:test"),assert=require("node:assert/strict"),fs=require("node:fs"),path=require("node:path"),vm=require("node:vm");
 const SOURCE=fs.existsSync(path.join(__dirname,"../shared/range-core.js"))?path.join(__dirname,"../shared"):path.join(__dirname,"../src");
-function load(){
+function load(timing=null){
   const context=vm.createContext({URL,AbortController,DOMException,Response,ReadableStream,Headers,Uint8Array,Promise,setTimeout,clearTimeout,performance,console});
   context.globalThis=context;
   // The resolver's short failure back-off uses Date.now. Tests move this clock forward.
   context.__now=1e12;
   vm.runInContext("Date.now=()=>globalThis.__now;",context);
-  for(const file of ["range-core.js","cdn-resolver.js","idm-downloader.js"])vm.runInContext(fs.readFileSync(path.join(SOURCE,file),"utf8"),context,{filename:file});
+  for(const file of ["range-core.js","cdn-resolver.js","idm-downloader.js"]){
+    vm.runInContext(fs.readFileSync(path.join(SOURCE,file),"utf8"),context,{filename:file});
+    // Some tests shorten the fixed timeouts so that a first-byte timeout does not take 5.5 s.
+    if(timing&&file==="range-core.js"){const core=context.__BILI_RANGE_CORE__;context.__BILI_RANGE_CORE__=Object.freeze({...core,normalizeSettings:input=>({...core.normalizeSettings(input),...timing})});}
+  }
   return {core:context.__BILI_RANGE_CORE__,cdn:context.__BILI_CDN_RESOLVER_FACTORY__,idm:context.__BILI_IDM_DOWNLOADER_FACTORY__,advance:ms=>{context.__now+=ms;}};
 }
 const mediaUrl=host=>`https://${host}/upgcxcode/00/00/1/1-1-30080.m4s?deadline=1&os=x`;
@@ -195,4 +199,90 @@ test("a piece with a single address survives failed replies instead of ending th
   const range={start:0,end:32767,length:32768};
   const result=await downloader.downloadRange(range,resolver,{parallel:true,kind:"video"});
   assert.equal(result.bytes.length,range.length);assert.equal(requests,3);
+});
+
+// The scheduler tests run against dev/network-sim.js, a stand-in CDN with made-up node speeds.
+const {createNetwork,watchVideo}=require("./network-sim.js");
+const MB=1024*1024;
+const overseasNodes=()=>({
+  [AKAMAI]:{ttfbMs:450,connBps:0.9*MB,totalBps:6*MB,sockets:6},
+  "upos-sz-mirrorcosov.bilivideo.com":{ttfbMs:120,connBps:1.6*MB,totalBps:9*MB},
+  "upos-sz-mirroraliov.bilivideo.com":{ttfbMs:260,connBps:1.1*MB,totalBps:6*MB},
+  "cn-hk-eq-01-01.bilivideo.com":{ttfbMs:1100,connBps:0.35*MB,totalBps:2*MB},
+  "cn-hk-eq-01-03.bilivideo.com":{ttfbMs:700,connBps:0.5*MB,totalBps:3*MB}
+});
+const shareOf=(network,host)=>(network.stats.byHost[host]?.bytes||0)/network.stats.sentBytes;
+
+test("fast nodes carry most of a video and almost nothing is downloaded twice",{timeout:120000},async()=>{
+  const lib=load();
+  const network=createNetwork({nodes:overseasNodes(),linkBps:12.5*MB});
+  try{
+    const nodeStats=lib.cdn.createNodeStats();
+    const first=await watchVideo(lib,network,{representation:{baseUrl:akamaiUrl("akam")},nodeStats,segments:6});
+    assert.deepEqual(Array.from(first.bans.hosts()),[]);
+    assert.ok(network.stats.canceledBytes<network.stats.sentBytes*0.05,`second copies took ${network.stats.canceledBytes} of ${network.stats.sentBytes} bytes`);
+    assert.ok(shareOf(network,"upos-sz-mirrorcosov.bilivideo.com")>shareOf(network,"upos-sz-mirroraliov.bilivideo.com"),"the fastest node carries the most");
+    assert.ok(shareOf(network,"cn-hk-eq-01-01.bilivideo.com")<0.1,"the slowest node carries little");
+    assert.ok(first.downloader.duplicateBytes<=network.stats.canceledBytes);
+    // After a seek the player starts again with new resolvers. What is known about the nodes
+    // is kept, so nothing is raced again and the restart is no slower than the cold start.
+    const racedBefore=network.stats.byHost["cn-hk-eq-01-01.bilivideo.com"].requests;
+    const second=await watchVideo(lib,network,{representation:{baseUrl:akamaiUrl("akam")},nodeStats,segments:2});
+    assert.ok(second.startupMs<=first.startupMs*1.25,`restart ${Math.round(second.startupMs)} ms, cold start ${Math.round(first.startupMs)} ms`);
+    assert.ok(network.stats.byHost["cn-hk-eq-01-01.bilivideo.com"].requests-racedBefore<=2,"the slowest node is not raced again");
+  }finally{network.stop();}
+});
+
+test("a node that turns slow in the middle of a video is left, and the video goes on",{timeout:120000},async()=>{
+  const lib=load();
+  const nodes=overseasNodes();
+  const network=createNetwork({nodes,linkBps:12.5*MB});
+  try{
+    const nodeStats=lib.cdn.createNodeStats(),bans=lib.cdn.createBanList();
+    await watchVideo(lib,network,{representation:{baseUrl:akamaiUrl("akam")},nodeStats,bans,segments:3});
+    const fast="upos-sz-mirrorcosov.bilivideo.com";
+    nodes[fast].connBps=8*1024;nodes[fast].totalBps=64*1024;
+    const before=network.stats.byHost[fast].bytes,sentBefore=network.stats.sentBytes;
+    const later=await watchVideo(lib,network,{representation:{baseUrl:akamaiUrl("akam")},nodeStats,bans,segments:5});
+    const share=(network.stats.byHost[fast].bytes-before)/(network.stats.sentBytes-sentBefore);
+    assert.ok(share<0.15,`the slow node still carried ${Math.round(share*100)}%`);
+    assert.ok(later.totalMs<20000,`took ${Math.round(later.totalMs)} ms`);
+  }finally{network.stop();}
+});
+
+test("a request left waiting in the browser does not count against a node that is sending",{timeout:120000},async()=>{
+  // Two sockets stand for the six a browser opens to an HTTP/1.1 node; the first-byte timeout
+  // is shortened to match. Requests beyond the sockets time out without ever being sent.
+  const lib=load({firstByteTimeoutMs:500});
+  const queueing="upos-sz-mirrorcosov.bilivideo.com",other="upos-sz-mirroraliov.bilivideo.com";
+  const network=createNetwork({nodes:{[queueing]:{ttfbMs:50,connBps:0.2*MB,sockets:2},[other]:{ttfbMs:80,connBps:0.2*MB}}});
+  try{
+    const banned=[],timeouts=[];
+    const bans=lib.cdn.createBanList({onBan:host=>banned.push(host)});
+    const resolver=lib.cdn.createResolver({baseUrl:mediaUrl(queueing)},()=> "overseas",bans);
+    const downloader=lib.idm.createDownloader({getSettings:()=>({concurrency:8,mode:"overseas"}),nativeFetch:network.fetch,onTransfer:event=>{if(event.phase==="error"&&/首字节/.test(event.error?.message))timeouts.push(event);return 1;}});
+    const range={start:0,end:2*MB-1,length:2*MB};
+    for(let round=0;round<3;round++)assert.equal((await downloader.downloadRange(range,resolver,{parallel:true,kind:"video"})).bytes.length,range.length);
+    assert.ok(timeouts.length>0,"some requests did wait past the first-byte timeout");
+    assert.ok(!banned.includes(queueing),"the node that was sending the whole time is not banned");
+    assert.ok(network.stats.byHost[queueing].bytes>0.2*network.stats.sentBytes,"and it keeps being used");
+    const before=timeouts.length;
+    await downloader.downloadRange(range,resolver,{parallel:true,kind:"video"});
+    assert.equal(timeouts.length,before,"once its limit is known it is not given more than it can carry");
+  }finally{network.stop();}
+});
+
+test("a node that is merely slower than the old fixed delay is not downloaded twice",{timeout:60000},async()=>{
+  const lib=load();
+  const slow="upos-sz-mirrorcosov.bilivideo.com";
+  const network=createNetwork({nodes:{[slow]:{ttfbMs:1200,connBps:4*MB}}});
+  try{
+    const resolver=lib.cdn.createResolver({baseUrl:mediaUrl(slow)},()=> "overseas");
+    const downloader=lib.idm.createDownloader({getSettings:()=>({concurrency:8,mode:"overseas"}),nativeFetch:network.fetch});
+    const range={start:0,end:MB-1,length:MB};
+    await downloader.downloadRange(range,resolver,{parallel:true,kind:"video"});
+    const learned=downloader.stats().copies;
+    await downloader.downloadRange(range,resolver,{parallel:true,kind:"video"});
+    assert.equal(downloader.stats().copies,learned,"once the node's usual first-byte time is known, waiting that long is not a reason for a copy");
+  }finally{network.stop();}
 });
