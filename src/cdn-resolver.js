@@ -114,6 +114,8 @@
   // node refuses. What has delivered data decides it. Refused by a node that serves other
   // addresses, the address is dropped; refused where other nodes serve it, the node is.
   // With neither known yet, the reply counts against nobody until one of them delivers.
+  // A node that delivers one address and refuses another that other nodes do serve loses only
+  // that address: banning the node took away the fastest one of an Akamai-only account.
   function createBanList(options = {}) {
     const limit = Math.max(1, Math.trunc(Number(options.limit)) || 2);
     const emptyReplies = new Map();
@@ -164,6 +166,7 @@
         judge(url, null);
       },
       allows: (url) => !banned.has(`node:${hostOf(url)}`) && !banned.has(`address:${addressOf(url)}`) && !banned.has(`pair:${hostOf(url)} ${addressOf(url)}`),
+      delivered: (url) => goodAddresses.has(addressOf(url)),
       allowsNode: (url) => !banned.has(`node:${hostOf(url)}`),
       allowsAddress: (url) => !banned.has(`address:${addressOf(url)}`),
       hosts: () => [...banned].filter((key) => key.startsWith("node:")).map((key) => key.slice(5)),
@@ -234,13 +237,32 @@
         if (item.receiving > 0) item.limit = Math.min(item.limit, item.receiving);
         else item.ttfbMs = blend(item.ttfbMs, waitedMs);
       },
+      // The other copy of the piece won before this node had sent anything. How long it had
+      // been waiting is the least its first byte would have taken.
+      outrun(url, waitedMs) {
+        const item = node(url);
+        if (waitedMs > item.ttfbMs) item.ttfbMs = blend(item.ttfbMs, waitedMs);
+      },
+      // The other copy won while this node was still sending. A transfer that is outrun never
+      // reaches body(), so a node that answers at once and then trickles would keep the speed
+      // it showed on a part of the file it had ready, and keep getting most of the pieces.
+      crawl(url, bytes, milliseconds) {
+        const item = node(url);
+        const bps = bytes / Math.max(0.02, milliseconds / 1000);
+        if (milliseconds >= 300 && bps < item.bps) item.bps = blend(item.bps, bps);
+      },
       full: (url) => node(url).inflight >= node(url).limit,
       // A node that is sending other pieces is alive, whatever happened to this one.
       busy: (url) => node(url).receiving > 0,
       known: (url) => node(url).bps > 0,
       inflight: (url) => node(url).inflight,
       ttfbMs: (url) => node(url).ttfbMs,
-      expectedMs
+      expectedMs,
+      bps: (url) => node(url).bps,
+      dump: () => Object.fromEntries([...nodes].map(([host, item]) => [host, {
+        ttfbMs: Math.round(item.ttfbMs), kbps: Math.round(item.bps / 1024), load: Math.round(item.load * 10) / 10,
+        limit: Number.isFinite(item.limit) ? item.limit : null, inflight: item.inflight
+      }]))
     });
   }
 
@@ -345,9 +367,13 @@
     }
 
     // The address expected to deliver a piece of this size first, counting what each node is
-    // already carrying. A node nothing is known about is tried with one piece at a time, but
-    // not while the player is waiting for its first frame (`explore` false).
-    function pick(candidates, tried, pieceBytes, explore = true) {
+    // already carrying. A node nothing is known about is tried with one piece at a time.
+    //
+    // `hurry` is set while the player has next to nothing buffered. One measurement must not
+    // decide where a whole segment goes then: a node that answered the first request of a
+    // video at once may need seconds for a part of the file it has not served lately. So the
+    // pieces are spread, unknown nodes take their share, and no node gets more than half.
+    function pick(candidates, tried, pieceBytes, hurry = false) {
       const now = Date.now();
       const untried = candidates.filter((url) => !tried.has(url));
       const open = untried.filter((url) => allows(url));
@@ -355,13 +381,18 @@
       const pool = ready.length ? ready : open.length ? open : untried;
       const known = pool.map((url) => nodeStats.expectedMs(url, pieceBytes)).filter((value) => value !== null);
       const best = known.length ? Math.min(...known) : 0;
+      const hosts = new Set(pool.map(hostOf));
+      const carried = [...hosts].reduce((sum, host) => sum + nodeStats.inflight(`https://${host}/`), 0);
       let chosen = null;
       let chosenCost = Infinity;
       for (const url of pool) {
         const inflight = nodeStats.inflight(url);
         const expected = nodeStats.expectedMs(url, pieceBytes);
         let cost = expected;
-        if (expected === null) cost = !known.length ? inflight : explore && !inflight ? best * 0.9 : best * 4 + inflight;
+        if (expected === null) cost = !known.length ? inflight : hurry ? best * 2 * (inflight + 1) : !inflight ? best * 0.9 : best * 4 + inflight;
+        if (hurry && hosts.size > 2 && inflight >= 2 && inflight * 2 > carried) cost += 1e5;
+        // The addresses of one node cost the same; the one that has delivered goes first.
+        if (bans?.delivered && !bans.delivered(url)) cost += 1;
         if (nodeStats.full(url)) cost += 1e6;
         if (cost < chosenCost) {
           chosen = url;
@@ -369,6 +400,15 @@
         }
       }
       return chosen;
+    }
+
+    // Small pieces cost a round trip each, and from far away that is most of their time: 64 KiB
+    // from a node 300 ms away that sends 3 MB/s is 300 ms of waiting for 20 ms of data, which
+    // made the nearest node look best however slow it was. A piece is sized to keep the
+    // fastest usable node sending for about 150 ms.
+    function pieceBytes(minimum) {
+      const fastest = Math.max(0, ...urls().map((url) => nodeStats.bps(url)));
+      return Math.max(minimum, Math.min(512 * 1024, Math.round(fastest * 0.15)));
     }
 
     // `busy` is a first byte that never came from a node that was sending other pieces at the
@@ -403,7 +443,7 @@
     }
 
     const allows = (url) => !bans || bans.allows(url);
-    return Object.freeze({ allows, failure, nodes: nodeStats, ordered, pick, rangeCandidates, rescueCandidates, startupCandidates, status, success, urls });
+    return Object.freeze({ allows, failure, nodes: nodeStats, ordered, pick, pieceBytes, rangeCandidates, rescueCandidates, startupCandidates, status, success, urls });
   }
 
   root.__BILI_CDN_RESOLVER_FACTORY__ = Object.freeze({
