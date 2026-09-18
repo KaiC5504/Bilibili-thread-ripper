@@ -6,6 +6,8 @@
 
   const PIECE_ROUNDS = 3;
   const PIECE_RETRY_WINDOW_MS = 25000;
+  const DUPLICATE_CANCELED = "并发副本已取消";
+  const NO_ADDRESS = "没有可用 CDN";
 
   function abortError(reason) {
     if (reason instanceof Error || reason instanceof DOMException) return reason;
@@ -17,7 +19,6 @@
       this.limit = limit;
       this.active = 0;
       this.queue = [];
-      this.sequence = 0;
     }
 
     setLimit(limit) {
@@ -25,14 +26,16 @@
       this.drain();
     }
 
+    // A priority can be a function: the second copy of a piece only becomes urgent once that
+    // piece is what the player is waiting for, which can happen while it is still queued.
     drain() {
       while (this.active < this.limit && this.queue.length) {
-        const entry = this.queue.shift();
-        entry.signal?.removeEventListener("abort", entry.cancel);
-        if (entry.signal?.aborted) {
-          entry.reject(abortError(entry.signal.reason));
-          continue;
+        let best = 0;
+        for (let index = 1; index < this.queue.length; index += 1) {
+          if (this.queue[index].priority() > this.queue[best].priority()) best = index;
         }
+        const entry = this.queue.splice(best, 1)[0];
+        entry.signal?.removeEventListener("abort", entry.canceled);
         this.active += 1;
         entry.resolve(() => {
           if (entry.released) return;
@@ -51,19 +54,15 @@
           resolve,
           signal,
           released: false,
-          priority: Number(priority) || 0,
-          sequence: this.sequence++
+          priority: typeof priority === "function" ? priority : () => Number(priority) || 0,
+          canceled: () => {
+            const at = this.queue.indexOf(entry);
+            if (at >= 0) this.queue.splice(at, 1);
+            reject(abortError(signal.reason));
+          }
         };
-        entry.cancel = () => {
-          const index = this.queue.indexOf(entry);
-          if (index < 0) return;
-          this.queue.splice(index, 1);
-          signal.removeEventListener("abort", entry.cancel);
-          reject(abortError(signal.reason));
-        };
-        signal?.addEventListener("abort", entry.cancel, { once: true });
+        signal?.addEventListener("abort", entry.canceled, { once: true });
         this.queue.push(entry);
-        this.queue.sort((a, b) => b.priority - a.priority || a.sequence - b.sequence);
         this.drain();
       });
     }
@@ -74,6 +73,8 @@
     const getSettings = options.getSettings;
     const onTransfer = typeof options.onTransfer === "function" ? options.onTransfer : () => null;
     const semaphore = new Semaphore(core.normalizeSettings(getSettings()).concurrency);
+    // duplicateBytes is what arrived on a second copy of a piece before the other copy won.
+    const counters = { requests: 0, copies: 0, bytes: 0, duplicateBytes: 0 };
 
     async function readBody(response, controller, transferId, settings, received) {
       if (!response.body?.getReader) {
@@ -106,6 +107,7 @@
           chunks.push(chunk);
           total += chunk.byteLength;
           received.bytes += chunk.byteLength;
+          received.lastByteAt = performance.now();
           onTransfer({ phase: "progress", id: transferId, bytes: chunk.byteLength });
         }
       } finally {
@@ -122,9 +124,20 @@
       return bytes;
     }
 
-    async function attempt(piece, url, signal, kind, resolver, priority = 0) {
+    // `choose` names the address only once a thread is free. More is known about the nodes by
+    // then than when the piece joined the queue, and a fast node ends up with more pieces.
+    async function attempt(piece, choose, signal, kind, resolver, priority = 0, watch = null) {
       const settings = core.normalizeSettings(getSettings());
       const release = await semaphore.acquire(signal, priority);
+      const url = choose();
+      if (!url) {
+        release();
+        throw new Error(NO_ADDRESS);
+      }
+      const nodes = resolver.nodes || null;
+      let receiving = false;
+      nodes?.begin(url);
+      counters.requests += 1;
       const controller = new AbortController();
       const cancel = () => controller.abort(abortError(signal?.reason));
       if (signal?.aborted) cancel();
@@ -133,7 +146,9 @@
       const totalTimer = setTimeout(() => controller.abort(new DOMException("CDN 子块总耗时超限", "TimeoutError")), settings.attemptTimeoutMs);
       const transferId = onTransfer({ phase: "start", kind, totalBytes: piece.length, url });
       const startedAt = performance.now();
-      const received = { bytes: 0 };
+      const received = watch || { bytes: 0 };
+      received.url = url;
+      received.startedAt = startedAt;
       try {
         const response = await nativeFetch(url, {
           method: "GET",
@@ -146,6 +161,10 @@
           signal: controller.signal
         });
         clearTimeout(firstByteTimer);
+        const firstByteAt = performance.now();
+        receiving = true;
+        received.firstByteAt = received.lastByteAt = firstByteAt;
+        nodes?.firstByte(url, firstByteAt - startedAt);
         const contentRange = core.parseContentRange(response.headers.get("content-range"));
         if (response.status !== 206 || !contentRange || contentRange.start !== piece.start || contentRange.end !== piece.end) {
           // The status tells a refused signed address (4xx) apart from a node that is down.
@@ -154,14 +173,22 @@
         const bytes = await readBody(response, controller, transferId, settings, received);
         if (bytes.byteLength !== piece.length) throw new Error(`子块长度不符：${bytes.byteLength}/${piece.length}`);
         const seconds = Math.max(0.001, (performance.now() - startedAt) / 1000);
+        nodes?.body(url, bytes.byteLength, performance.now() - firstByteAt);
         resolver.success(url, bytes.byteLength / seconds);
+        counters.bytes += bytes.byteLength;
         onTransfer({ phase: "done", id: transferId });
         return { bytes, total: contentRange.total, url };
       } catch (error) {
+        const silent = !receiving && error?.name === "TimeoutError";
+        const busy = silent && Boolean(nodes?.busy(url));
+        if (silent) nodes?.silent(url, performance.now() - startedAt);
+        if (error?.message === DUPLICATE_CANCELED) counters.duplicateBytes += received.bytes;
         // Received bytes tell a dead node (0 KiB) apart from a transfer that stalled midway.
-        resolver.failure(url, error, received.bytes);
+        resolver.failure(url, error, received.bytes, busy);
         const canceled = error?.name === "AbortError";
         onTransfer({ phase: canceled ? "cancel" : "error", id: transferId, error });
+        received.failed = true;
+        received.wake?.();
         throw error;
       } finally {
         clearTimeout(firstByteTimer);
@@ -170,6 +197,7 @@
         // response too, otherwise it keeps downloading after releasing the slot.
         controller.abort();
         signal?.removeEventListener("abort", cancel);
+        nodes?.end(url, receiving);
         release();
       }
     }
@@ -208,11 +236,48 @@
       return candidates;
     }
 
-    async function downloadPiece(piece, resolver, signal, kind, preferredUrls, startupMode = false, priority = 0) {
+    // Settles once a second copy of the piece is worth its bandwidth: the first byte is
+    // taking far longer than this node usually needs, the transfer has stopped, or it is
+    // heading for several times the expected duration. A fixed delay copied every piece
+    // that was merely not finished yet, and the copies took the bandwidth it was short of.
+    function overdue(watch, piece, resolver, settings, startup, signal) {
+      return new Promise((resolve) => {
+        const nodes = resolver.nodes || null;
+        let timer = setTimeout(check, 150);
+        function done() {
+          clearTimeout(timer);
+          signal.removeEventListener("abort", done);
+          resolve();
+        }
+        function check() {
+          timer = setTimeout(check, 150);
+          if (!watch.startedAt) return;
+          const now = performance.now();
+          const elapsed = now - watch.startedAt;
+          if (!watch.firstByteAt) {
+            const usual = nodes?.ttfbMs(watch.url) || 0;
+            const budget = usual
+              ? Math.min(3000, Math.max(startup ? 400 : 600, usual * 3))
+              : startup ? Math.min(600, settings.hedgeDelayMs) : settings.hedgeDelayMs;
+            if (elapsed >= budget) done();
+            return;
+          }
+          if (now - watch.lastByteAt >= 1500) return done();
+          const expected = nodes?.expectedMs(watch.url, piece.length) || settings.hedgeDelayMs;
+          if (elapsed >= Math.max(settings.hedgeDelayMs, expected * 3) && watch.bytes < piece.length * 0.75) done();
+        }
+        watch.wake = done;
+        if (signal.aborted) done();
+        else signal.addEventListener("abort", done, { once: true });
+      });
+    }
+
+    // `urgent` tells whether the player is waiting for this very piece. Only then may its
+    // second copy go ahead of pieces that have not been asked for at all.
+    async function downloadPiece(piece, resolver, signal, kind, preferredUrls, startupMode = false, priority = 0, urgent = null) {
       const settings = core.normalizeSettings(getSettings());
       const allowed = (url) => typeof resolver.allows !== "function" || resolver.allows(url);
       const startup = startupMode === true || startupMode === "probe";
-      const probe = startupMode === "probe";
       const startedAt = performance.now();
       let lastError = null;
 
@@ -226,61 +291,60 @@
         }
         const candidates = pieceCandidates(piece, resolver, preferredUrls, round);
         const limit = Math.min(8, candidates.length);
-        const batchWidth = probe ? limit : 2;
         const tried = new Set();
+        // A node banned while this piece was waiting is skipped, unless only banned nodes are left.
+        const choose = () => {
+          if (tried.size >= limit) return null;
+          const untried = candidates.filter((url) => !tried.has(url));
+          const url = typeof resolver.pick === "function"
+            ? resolver.pick(candidates, tried, piece.length, !startup)
+            : untried.find(allowed) || untried[0];
+          if (url) tried.add(url);
+          return url || null;
+        };
+        // With nothing known about any node yet, the first piece of a video is asked of all
+        // of them at once: the fastest answer starts playback and every node gets measured.
+        const race = startupMode === "probe" && !candidates.some((url) => resolver.nodes?.known(url));
         while (tried.size < limit) {
           if (signal?.aborted) throw abortError(signal.reason);
-          // A node banned while this piece was waiting is skipped, unless only banned nodes are left.
-          const untried = candidates.filter((url) => !tried.has(url));
-          const open = untried.filter(allowed);
-          const pair = (open.length ? open : untried).slice(0, batchWidth);
-          if (!pair.length) break;
-          pair.forEach((url) => tried.add(url));
-          const controllers = pair.map(() => new AbortController());
+          const before = tried.size;
+          const controllers = Array.from({ length: race ? limit : 2 }, () => new AbortController());
           const cancelAll = () => controllers.forEach((controller) => controller.abort(abortError(signal?.reason)));
           if (signal?.aborted) cancelAll();
           else signal?.addEventListener("abort", cancelAll, { once: true });
-          // A first copy that is refused at once (HTTP 403) should not leave the piece idle
-          // for the rest of the hedge delay.
-          let firstFailed = () => {};
-          const firstFailure = new Promise((resolve) => { firstFailed = resolve; });
-          const attempts = pair.map((url, pairIndex) => (async () => {
-            if (pairIndex) await new Promise((resolve, reject) => {
-              const delay = probe ? 0 : startup ? Math.min(250, settings.hedgeDelayMs) : settings.hedgeDelayMs;
-              const timer = setTimeout(resolve, delay);
-              firstFailure.then(() => {
-                clearTimeout(timer);
-                resolve();
-              });
-              const canceled = () => {
-                clearTimeout(timer);
-                reject(abortError(controllers[pairIndex].signal.reason));
-              };
-              if (controllers[pairIndex].signal.aborted) canceled();
-              else controllers[pairIndex].signal.addEventListener("abort", canceled, { once: true });
-            });
-            try {
-              return await attempt(piece, url, controllers[pairIndex].signal, kind, resolver, priority + (pairIndex ? 20 : 0));
-            } catch (error) {
-              if (!pairIndex) firstFailed();
-              throw error;
+          const watch = { bytes: 0 };
+          const attempts = controllers.map((controller, copy) => (async () => {
+            if (copy && !race) {
+              await overdue(watch, piece, resolver, settings, startup, controller.signal);
+              if (controller.signal.aborted) throw abortError(controller.signal.reason);
+              if (!watch.failed) counters.copies += 1;
             }
+            const copyPriority = copy && !race ? () => (!urgent || urgent() ? priority + 20 : priority - 100) : priority;
+            return attempt(piece, choose, controller.signal, kind, resolver, copyPriority, copy ? null : watch);
           })());
+          const cancelCopies = () => {
+            signal?.removeEventListener("abort", cancelAll);
+            controllers.forEach((controller) => {
+              if (!controller.signal.aborted) controller.abort(new DOMException(DUPLICATE_CANCELED, "AbortError"));
+            });
+          };
           try {
             const winner = await Promise.any(attempts);
-            controllers.forEach((controller) => {
-              if (!controller.signal.aborted) controller.abort(new DOMException("并发副本已取消", "AbortError"));
-            });
+            // The other nodes of that first race get a moment to finish their 64 KiB, so that
+            // each of them has been measured once. Nodes are not raced again on this page.
+            if (race) setTimeout(cancelCopies, 1500);
+            else cancelCopies();
             return winner;
           } catch (aggregate) {
-            lastError = aggregate?.errors?.at?.(-1) || aggregate;
-            if (signal?.aborted) throw abortError(signal.reason);
-          } finally {
+            const errors = aggregate?.errors || [aggregate];
+            lastError = errors.find((error) => error?.message !== NO_ADDRESS) || errors.at(-1);
             signal?.removeEventListener("abort", cancelAll);
+            if (signal?.aborted) throw abortError(signal.reason);
           }
+          if (tried.size === before) break;
         }
       }
-      throw lastError || new Error("没有可用 CDN");
+      throw lastError || new Error(NO_ADDRESS);
     }
 
     async function delayedAttempt(piece, url, delayMs, signal, kind, resolver, controller, priority = 0) {
@@ -296,7 +360,7 @@
         });
       }
       if (signal?.aborted) throw abortError(signal.reason);
-      return attempt(piece, url, controller.signal, kind, resolver, priority);
+      return attempt(piece, () => url, controller.signal, kind, resolver, priority);
     }
 
     async function startupAttempt(piece, candidates, resolver, options) {
@@ -309,10 +373,13 @@
       try {
         let winner;
         try {
+          // The copies used to follow after 120 and 300 ms whatever the node. A node that
+          // usually needs longer than that for its first byte got all three every time.
+          const step = Math.min(600, Math.max(120, (resolver.nodes?.ttfbMs(candidates[0]) || 0) * 1.5));
           winner = await Promise.any(candidates.map((url, index) => delayedAttempt(
             piece,
             url,
-            index === 0 ? 0 : index === 1 ? 120 : 300,
+            index === 0 ? 0 : index === 1 ? step : step * 2.5,
             options.signal,
             options.kind || "meta",
             resolver,
@@ -345,8 +412,16 @@
           await pause(Math.min(2000, 500 * (2 ** (round - 1))), options.signal);
         }
         let candidates = (typeof resolver.startupCandidates === "function" ? resolver.startupCandidates() : resolver.urls())
-          .filter((url, index, all) => all.indexOf(url) === index)
-          .slice(0, 3);
+          .filter((url, index, all) => all.indexOf(url) === index);
+        if (typeof resolver.pick === "function") {
+          const chosen = new Set();
+          while (chosen.size < 3) {
+            const url = resolver.pick(candidates, chosen, piece.length);
+            if (!url) break;
+            chosen.add(url);
+          }
+          candidates = [...chosen];
+        } else candidates = candidates.slice(0, 3);
         if (!candidates.length && round) candidates = resolver.ordered(round).slice(0, 3);
         if (!candidates.length) break;
         try {
@@ -363,6 +438,23 @@
         }
       }
       throw lastError || new Error("没有可用 CDN");
+    }
+
+    // The second copy of a piece is urgent when that piece is the one holding up the append,
+    // or one of the last few its range is waiting for.
+    function trackPieces(count) {
+      const finished = new Array(count).fill(false);
+      let first = 0;
+      let left = count;
+      return {
+        finish(index) {
+          if (finished[index]) return;
+          finished[index] = true;
+          left -= 1;
+          while (finished[first]) first += 1;
+        },
+        urgent: (index) => index <= first || left <= Math.max(2, count >> 3)
+      };
     }
 
     async function downloadStartupMediaRange(range, resolver, options, settings) {
@@ -412,6 +504,7 @@
         settings.minChunkBytes
       ).map((piece, index) => ({ ...piece, index: index + 1 }));
       const ordered = new Array(pieces.length);
+      const progress = trackPieces(pieces.length);
       let nextOrderedIndex = 0;
       let flushOperation = Promise.resolve();
       const flushOrdered = () => {
@@ -433,8 +526,10 @@
           options.kind || "media",
           [headResult.url],
           true,
-          120 - Math.min(30, piece.index)
+          120 - Math.min(30, piece.index),
+          () => progress.urgent(orderedIndex)
         );
+        progress.finish(orderedIndex);
         ordered[orderedIndex] = result;
         await flushOrdered();
         return result;
@@ -486,6 +581,7 @@
         parallel ? settings.minChunkBytes : Number.MAX_SAFE_INTEGER
       );
       const progressive = typeof options.onOrderedChunk === "function";
+      const progress = trackPieces(pieces.length);
       const ordered = new Array(pieces.length);
       let nextOrderedIndex = 0;
       let flushOperation = Promise.resolve();
@@ -508,8 +604,10 @@
           options.kind || "media",
           preferredUrls,
           options.startup === true,
-          basePriority - Math.min(20, piece.index)
+          basePriority - Math.min(20, piece.index),
+          () => progress.urgent(piece.index)
         );
+        progress.finish(piece.index);
         if (progressive) {
           ordered[piece.index] = result;
           await flushOrdered();
@@ -529,7 +627,11 @@
       };
     }
 
-    return Object.freeze({ downloadRange, applySettings: () => semaphore.setLimit(core.normalizeSettings(getSettings()).concurrency) });
+    return Object.freeze({
+      downloadRange,
+      applySettings: () => semaphore.setLimit(core.normalizeSettings(getSettings()).concurrency),
+      stats: () => ({ ...counters })
+    });
   }
 
   root.__BILI_IDM_DOWNLOADER_FACTORY__ = Object.freeze({ createDownloader });

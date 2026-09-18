@@ -620,9 +620,10 @@
         startTime: Math.max(0, Number(playbackState.time) || 0),
         forceStartTime: Boolean(playbackState.forceTime),
         internalSeekTarget: null,
-        // One ban list per video, shared by every quality and by the audio track.
-        videoResolver: resolverFactory.createResolver(representation, () => core.normalizeSettings(getSettings()).mode, options.cdnBans, () => core.normalizeSettings(getSettings()).customHosts),
-        audioResolver: resolverFactory.createResolver(selection.audio, () => core.normalizeSettings(getSettings()).mode, options.cdnBans, () => core.normalizeSettings(getSettings()).customHosts)
+        // One ban list per video, shared by every quality and by the audio track. What has been
+        // measured about the nodes is kept for the whole page, so a seek does not start over.
+        videoResolver: resolverFactory.createResolver(representation, () => core.normalizeSettings(getSettings()).mode, options.cdnBans, () => core.normalizeSettings(getSettings()).customHosts, options.nodeStats || undefined),
+        audioResolver: resolverFactory.createResolver(selection.audio, () => core.normalizeSettings(getSettings()).mode, options.cdnBans, () => core.normalizeSettings(getSettings()).customHosts, options.nodeStats || undefined)
       };
       session = candidate;
       if (previous) disposeSession(previous, false);
@@ -876,6 +877,7 @@
         lastSeekMs: Math.round(lastSeekMs),
         stallsAfterSeek,
         timeline: timeline.slice(),
+        download: downloader.stats?.() || null,
         tracks: (session?.tracks || []).map((track) => ({ kind: track.kind, nextIndex: track.nextIndex, segments: track.sidx.segments.length }))
       })
     });

@@ -31,6 +31,7 @@
       else notices?.log("已停用这个 CDN 节点", `${host} 两次没有返回任何数据，这个视频接下来不再使用它。`, "error", "", cdnBanRoute, "download");
     }
   }) || null;
+  const nodeStats = root.__BILI_CDN_RESOLVER_FACTORY__?.createNodeStats?.() || null;
   let playerContainer = null;
   let playerLifecycle = 0;
   let qualityPlayer = null;
@@ -874,6 +875,8 @@
     while (recentBytes.length && now - recentBytes[0].at > 1000) recentBytes.shift();
     const track = info.tracks?.find((item) => item.kind === "video");
     const frames = player.video?.getVideoPlaybackQuality?.();
+    // Bytes that arrived on a second copy of a piece after the other copy had already won.
+    const repeated = info.download?.bytes ? `，重复下载 ${(info.download.duplicateBytes / (info.download.bytes + info.download.duplicateBytes) * 100).toFixed(1)}%` : "";
     return {
       "Mime Type": `${info.videoType}, ${info.audioType}`,
       "Player Type": "BTR Native",
@@ -886,7 +889,7 @@
       "Audio Host": lastHostByKind.audio || undefined,
       "Video Speed": `${measuredSpeed("video", now)} Kbps`,
       "Audio Speed": `${measuredSpeed("audio", now)} Kbps`,
-      "Network Activity": `${Math.round(recentBytes.reduce((sum, item) => sum + item.bytes, 0) / 1024)} KB`
+      "Network Activity": `${Math.round(recentBytes.reduce((sum, item) => sum + item.bytes, 0) / 1024)} KB${repeated}`
     };
   }
 
@@ -1022,6 +1025,7 @@
         poster: String(root.__INITIAL_STATE__?.videoData?.pic || ""),
         onTransfer,
         cdnBans,
+        nodeStats,
         onLog(title, detail, level = "info", category = "other") {
           if (lifecycle !== playerLifecycle) return;
           notices?.log(title, detail, level, "", route, category);
