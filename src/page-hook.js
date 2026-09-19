@@ -1224,11 +1224,12 @@
       // in the console and paste the result.
       report: () => {
         const debug = player?.getDebug?.() || {};
-        const { timeline = [], ...rest } = debug;
-        // Node names and states only: no download address or account data.
+        const { timeline = [], requests = [], ...rest } = debug;
+        // Node names, states and measured speeds only: no download address or account data.
         return JSON.stringify({
           version: stats.version, at: Math.round(performance.now()), settings: { takeover: settings.takeover, mode: settings.mode, customHosts: settings.customHosts.slice(), concurrency: settings.concurrency, codec: nativeCodec() || "default" },
-          state: stats.playerState, lastError: stats.lastError, player: rest, nodes: stats.cdnHosts.map((item) => ({ ...item })), bannedNodes: cdnBans?.hosts?.() || [], page: pageEvents.slice(), timeline
+          state: stats.playerState, lastError: stats.lastError, player: rest, nodes: stats.cdnHosts.map((item) => ({ ...item })), measured: nodeStats?.dump?.() || null, bannedNodes: cdnBans?.hosts?.() || [], page: pageEvents.slice(), timeline,
+          requests: requests.map((item) => [item.at, item.kind, item.node.split(".")[0], item.bytes, item.firstByteMs, item.ms, item.end].join(" "))
         }, null, 1);
       },
       version: "0.9.2.3"

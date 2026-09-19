@@ -878,6 +878,7 @@
         stallsAfterSeek,
         timeline: timeline.slice(),
         download: downloader.stats?.() || null,
+        requests: downloader.recent?.() || [],
         tracks: (session?.tracks || []).map((track) => ({ kind: track.kind, nextIndex: track.nextIndex, segments: track.sidx.segments.length }))
       })
     });
