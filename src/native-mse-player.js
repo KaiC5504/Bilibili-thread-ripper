@@ -694,7 +694,7 @@
       const restarting = target < 1 && (video.ended || performance.now() - endedAt < 2000);
       await startSession(selectedVideo, {
         time: target,
-        resume: !video.paused || restarting,
+        resume: wantsToPlay() || restarting,
         volume: video.volume,
         muted: video.muted,
         playbackRate: video.playbackRate
@@ -735,10 +735,20 @@
       publishState({ playerState: "ended", bufferedAhead: 0 });
     }, { signal: eventController.signal });
 
+    // Whether the viewer means the video to play. While a session is still loading, or while
+    // we paused it ourselves to rebuffer, the element is paused whatever the viewer wants and
+    // the session remembers the intent. Reading video.paused then made a second drag of the
+    // progress bar, or a quality change during loading, leave the video paused for good.
+    function wantsToPlay() {
+      const candidate = session;
+      if (candidate && sessionIsCurrent(candidate) && (!candidate.playbackActivated || candidate.recovering)) return Boolean(candidate.resumeWanted);
+      return !video.paused;
+    }
+
     function playbackState() {
       return {
         time: Number(video.currentTime) || 0,
-        resume: !video.paused || Number(video.currentTime) < 1,
+        resume: wantsToPlay() || Number(video.currentTime) < 1,
         volume: video.volume,
         muted: video.muted,
         playbackRate: video.playbackRate || 1
@@ -832,13 +842,14 @@
 
     return Object.freeze({
       applySettings() { ensureBuffer(); },
+      wantsToPlay,
       destroy,
       setCodec,
       setQuality,
       updatePlayinfo,
       video,
       getDebug: () => ({
-        version: "0.9.2.2",
+        version: "0.9.2.3",
         architecture: "bilibili-native-ui-progressive-mse-0.8-core",
         quality: qualityLabel(selectedVideo),
         qualityId: Number(selectedVideo?.id) || 0,

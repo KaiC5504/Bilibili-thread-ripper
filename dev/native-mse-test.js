@@ -119,6 +119,25 @@
     while (Date.now() - pausedStartedAt < 8000 && video.paused) await new Promise((resolve) => setTimeout(resolve, 200));
     loop.stayedPaused = video.paused;
   }
+  // Two drags of the progress bar shortly after one another while the video plays. The
+  // second one arrives while the first is still loading, when the element is paused whatever
+  // the viewer wants; the video has to go on playing at the second position.
+  const doubleSeek = { keptPlaying: false, position: 0 };
+  if (endedFired && !probe.errors.length) {
+    video.play().catch(() => {});
+    const playStartedAt = Date.now();
+    while (Date.now() - playStartedAt < 15000 && (video.paused || video.readyState < 3)) await new Promise((resolve) => setTimeout(resolve, 200));
+    const first = Math.max(5, endTarget * 0.25), second = Math.max(10, endTarget * 0.6);
+    video.currentTime = first;
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    video.currentTime = second;
+    const doubleStartedAt = Date.now();
+    while (Date.now() - doubleStartedAt < 25000 && !probe.errors.length) {
+      if (!video.paused && Number(video.currentTime) > second + 0.5 && Number(video.currentTime) < second + 20) { doubleSeek.keptPlaying = true; break; }
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+    doubleSeek.position = Number(video.currentTime) || 0;
+  }
   // Bilibili's own toasts stay visible; its error panel is hidden only while BTR plays and
   // what it said is in the log.
   const shown = (selector) => getComputedStyle(document.querySelector(selector)).display !== "none";
@@ -150,6 +169,7 @@
     endTarget,
     endedFired,
     loop,
+    doubleSeek,
     endMediaSourceState: endDebug.mediaSourceState,
     endDuration,
     durationRefusals: root.__durationRefusals || 0,
@@ -160,7 +180,7 @@
     nativeSourceChanges: probe.nativeSourceChanges,
     errors: probe.errors
   };
-  output.pass = output.version === "0.9.2.2"
+  output.pass = output.version === "0.9.2.3"
     && output.architecture === "bilibili-native-ui-progressive-mse-0.8-core"
     && output.originalUiCount === 1
     && output.videoCount === 1
@@ -176,6 +196,7 @@
     && output.endedFired
     && output.loop.ranAgain
     && output.loop.stayedPaused === true
+    && output.doubleSeek.keptPlaying
     && output.endMediaSourceState === "ended"
     && output.durationRefusals === 0
     && output.nativeLayers.toastVisible

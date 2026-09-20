@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili 线程撕裂者
 // @namespace    https://github.com/MrTangLuyao/Bilibili-thread-ripper
-// @version      0.9.2.2
+// @version      0.9.2.3
 // @description  保留哔哩哔哩原生播放器，通过多 CDN、多 Range 并发下载改善视频缓冲速度。
 // @author       MrTangLuyao
 // @license      MIT
@@ -1918,7 +1918,7 @@ const chrome = (() => {
       const restarting = target < 1 && (video.ended || performance.now() - endedAt < 2000);
       await startSession(selectedVideo, {
         time: target,
-        resume: !video.paused || restarting,
+        resume: wantsToPlay() || restarting,
         volume: video.volume,
         muted: video.muted,
         playbackRate: video.playbackRate
@@ -1959,10 +1959,20 @@ const chrome = (() => {
       publishState({ playerState: "ended", bufferedAhead: 0 });
     }, { signal: eventController.signal });
 
+    // Whether the viewer means the video to play. While a session is still loading, or while
+    // we paused it ourselves to rebuffer, the element is paused whatever the viewer wants and
+    // the session remembers the intent. Reading video.paused then made a second drag of the
+    // progress bar, or a quality change during loading, leave the video paused for good.
+    function wantsToPlay() {
+      const candidate = session;
+      if (candidate && sessionIsCurrent(candidate) && (!candidate.playbackActivated || candidate.recovering)) return Boolean(candidate.resumeWanted);
+      return !video.paused;
+    }
+
     function playbackState() {
       return {
         time: Number(video.currentTime) || 0,
-        resume: !video.paused || Number(video.currentTime) < 1,
+        resume: wantsToPlay() || Number(video.currentTime) < 1,
         volume: video.volume,
         muted: video.muted,
         playbackRate: video.playbackRate || 1
@@ -2056,13 +2066,14 @@ const chrome = (() => {
 
     return Object.freeze({
       applySettings() { ensureBuffer(); },
+      wantsToPlay,
       destroy,
       setCodec,
       setQuality,
       updatePlayinfo,
       video,
       getDebug: () => ({
-        version: "0.9.2.2",
+        version: "0.9.2.3",
         architecture: "bilibili-native-ui-progressive-mse-0.8-core",
         quality: qualityLabel(selectedVideo),
         qualityId: Number(selectedVideo?.id) || 0,
@@ -3309,7 +3320,7 @@ const chrome = (() => {
   let transferSequence = 1;
   const transfers = new Map();
   const stats = {
-    version: "0.9.2.2",
+    version: "0.9.2.3",
     architecture: "bilibili-native-ui-progressive-mse-0.8-core",
     mode: settings.mode,
     playerState: "waiting",
@@ -3329,6 +3340,16 @@ const chrome = (() => {
     lastError: "",
     takeoverError: null
   };
+
+  // What happened to the takeover on this page: each player keeps its own timeline, which is
+  // gone once it is replaced, and that is exactly when a report is needed (a video that went
+  // black and came back at another position). Positions and states only.
+  const pageEvents = [];
+  function remember(what, detail = "") {
+    const video = player?.video || document.querySelector("#bilibili-player video, .bpx-player-container video");
+    pageEvents.push({ at: Math.round(performance.now()), time: Math.round((Number(video?.currentTime) || 0) * 10) / 10, what, detail: String(detail).slice(0, 120) });
+    if (pageEvents.length > 60) pageEvents.shift();
+  }
 
   function clearTakeoverFailure() {
     takeoverFailureRoute = "";
@@ -3912,12 +3933,15 @@ const chrome = (() => {
   }
 
   // Stopping our player pauses the video. When the next takeover follows (another video in
-  // the page, a retake), it goes on playing only if it was playing here (issue #13).
+  // the page, a retake), it goes on playing only if it was playing here (issue #13). After a
+  // failed download the video goes back to Bilibili, which may leave it paused on its own
+  // error; the automatic retake that follows, up to 16 seconds later, then goes on playing too.
   let resumeHint = null;
-  function takeResumeHint() {
+  function takeResumeHint(afterFailure) {
     const hint = resumeHint;
     resumeHint = null;
-    return Boolean(hint?.playing && Date.now() - hint.at < 15000);
+    if (!hint?.playing) return false;
+    return hint.handedBack ? afterFailure && Date.now() - hint.at < 45000 : Date.now() - hint.at < 15000;
   }
 
   // The player's own "自动开播" switch. Unknown counts as on, as before.
@@ -3929,7 +3953,10 @@ const chrome = (() => {
   function stopPlayer(resumeNative = true) {
     nativeCoreWait = null;
     const current = player;
-    if (current && !resumeNative) resumeHint = { playing: Boolean(current.video && !current.video.paused), at: Date.now() };
+    if (current) remember(resumeNative ? "handed back to Bilibili" : "player stopped", stats.playerState);
+    // While a session loads or has failed the element is paused whatever the viewer wants;
+    // the player knows the intent.
+    if (current) resumeHint = { playing: Boolean(current.wantsToPlay ? current.wantsToPlay() : current.video && !current.video.paused), at: Date.now(), handedBack: resumeNative };
     notices?.detach(resumeNative ? "已停止加速，交回 B 站原来的连接" : "已停止接管上一个视频");
     playerLifecycle += 1;
     player = null;
@@ -3977,6 +4004,7 @@ const chrome = (() => {
   function handleNativeSourceChange(route, lifecycle) {
     setTimeout(() => {
       if (lifecycle !== playerLifecycle || !player || playerRoute !== route) return;
+      remember("Bilibili replaced the video source");
       routeGeneration += 1;
       routeRequestController?.abort();
       routeRequestController = null;
@@ -4228,7 +4256,7 @@ const chrome = (() => {
     }
     const preferredQuality = nativeQuality();
     const preferredCodec = nativeCodec();
-    const resumeAfterStop = takeResumeHint();
+    const resumeAfterStop = takeResumeHint(autoRetakeRoute === route && autoRetakeCount > 0);
     for (const meter of Object.values(speedMeters)) meter.shown = 0;
     try {
       // The compatibility mode needs Bilibili's own playback core; without it the video is
@@ -4298,6 +4326,7 @@ const chrome = (() => {
         },
         onFatal(error) {
           if (lifecycle !== playerLifecycle) return;
+          remember("playback failed", error?.message || error);
           failedRoute = route;
           recordTakeoverFailure(route, "mse", error, true);
           setTimeout(() => {
@@ -4316,6 +4345,7 @@ const chrome = (() => {
         return;
       }
       player = nextPlayer;
+      remember("took over", `${route}${nextPlayer.nativeTransport ? " (兼容模式)" : ""}`);
       stats.architecture = nextPlayer.nativeTransport ? "native-player-range-transport" : "bilibili-native-ui-progressive-mse-0.8-core";
       playerRoute = route;
       playerContainer = container;
@@ -4451,11 +4481,11 @@ const chrome = (() => {
         const { timeline = [], ...rest } = debug;
         // Node names and states only: no download address or account data.
         return JSON.stringify({
-          version: stats.version, at: Math.round(performance.now()), settings: { mode: settings.mode, customHosts: settings.customHosts.slice(), concurrency: settings.concurrency, codec: nativeCodec() || "default" },
-          state: stats.playerState, player: rest, nodes: stats.cdnHosts.map((item) => ({ ...item })), bannedNodes: cdnBans?.hosts?.() || [], timeline
+          version: stats.version, at: Math.round(performance.now()), settings: { takeover: settings.takeover, mode: settings.mode, customHosts: settings.customHosts.slice(), concurrency: settings.concurrency, codec: nativeCodec() || "default" },
+          state: stats.playerState, lastError: stats.lastError, player: rest, nodes: stats.cdnHosts.map((item) => ({ ...item })), bannedNodes: cdnBans?.hosts?.() || [], page: pageEvents.slice(), timeline
         }, null, 1);
       },
-      version: "0.9.2.2"
+      version: "0.9.2.3"
     })
   });
   publish();
@@ -4772,7 +4802,7 @@ const chrome = (() => {
   "use strict";
 
   const CHANNEL = "__BILI_RANGE_ACCELERATOR_V1__";
-  const VERSION = "0.9.2.2";
+  const VERSION = "0.9.2.3";
   const notices = globalThis.__BTR_NOTIFICATION_VIEW__;
   const ERROR_NOTICE_ID = "__bilibili_thread_ripper_error_notice__";
   const ERROR_NOTICE_STYLE_ID = "__bilibili_thread_ripper_error_notice_style__";

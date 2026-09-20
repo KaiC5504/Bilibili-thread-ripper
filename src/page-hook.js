@@ -62,7 +62,7 @@
   let transferSequence = 1;
   const transfers = new Map();
   const stats = {
-    version: "0.9.2.2",
+    version: "0.9.2.3",
     architecture: "bilibili-native-ui-progressive-mse-0.8-core",
     mode: settings.mode,
     playerState: "waiting",
@@ -82,6 +82,16 @@
     lastError: "",
     takeoverError: null
   };
+
+  // What happened to the takeover on this page: each player keeps its own timeline, which is
+  // gone once it is replaced, and that is exactly when a report is needed (a video that went
+  // black and came back at another position). Positions and states only.
+  const pageEvents = [];
+  function remember(what, detail = "") {
+    const video = player?.video || document.querySelector("#bilibili-player video, .bpx-player-container video");
+    pageEvents.push({ at: Math.round(performance.now()), time: Math.round((Number(video?.currentTime) || 0) * 10) / 10, what, detail: String(detail).slice(0, 120) });
+    if (pageEvents.length > 60) pageEvents.shift();
+  }
 
   function clearTakeoverFailure() {
     takeoverFailureRoute = "";
@@ -665,12 +675,15 @@
   }
 
   // Stopping our player pauses the video. When the next takeover follows (another video in
-  // the page, a retake), it goes on playing only if it was playing here (issue #13).
+  // the page, a retake), it goes on playing only if it was playing here (issue #13). After a
+  // failed download the video goes back to Bilibili, which may leave it paused on its own
+  // error; the automatic retake that follows, up to 16 seconds later, then goes on playing too.
   let resumeHint = null;
-  function takeResumeHint() {
+  function takeResumeHint(afterFailure) {
     const hint = resumeHint;
     resumeHint = null;
-    return Boolean(hint?.playing && Date.now() - hint.at < 15000);
+    if (!hint?.playing) return false;
+    return hint.handedBack ? afterFailure && Date.now() - hint.at < 45000 : Date.now() - hint.at < 15000;
   }
 
   // The player's own "自动开播" switch. Unknown counts as on, as before.
@@ -682,7 +695,10 @@
   function stopPlayer(resumeNative = true) {
     nativeCoreWait = null;
     const current = player;
-    if (current && !resumeNative) resumeHint = { playing: Boolean(current.video && !current.video.paused), at: Date.now() };
+    if (current) remember(resumeNative ? "handed back to Bilibili" : "player stopped", stats.playerState);
+    // While a session loads or has failed the element is paused whatever the viewer wants;
+    // the player knows the intent.
+    if (current) resumeHint = { playing: Boolean(current.wantsToPlay ? current.wantsToPlay() : current.video && !current.video.paused), at: Date.now(), handedBack: resumeNative };
     notices?.detach(resumeNative ? "已停止加速，交回 B 站原来的连接" : "已停止接管上一个视频");
     playerLifecycle += 1;
     player = null;
@@ -730,6 +746,7 @@
   function handleNativeSourceChange(route, lifecycle) {
     setTimeout(() => {
       if (lifecycle !== playerLifecycle || !player || playerRoute !== route) return;
+      remember("Bilibili replaced the video source");
       routeGeneration += 1;
       routeRequestController?.abort();
       routeRequestController = null;
@@ -981,7 +998,7 @@
     }
     const preferredQuality = nativeQuality();
     const preferredCodec = nativeCodec();
-    const resumeAfterStop = takeResumeHint();
+    const resumeAfterStop = takeResumeHint(autoRetakeRoute === route && autoRetakeCount > 0);
     for (const meter of Object.values(speedMeters)) meter.shown = 0;
     try {
       // The compatibility mode needs Bilibili's own playback core; without it the video is
@@ -1051,6 +1068,7 @@
         },
         onFatal(error) {
           if (lifecycle !== playerLifecycle) return;
+          remember("playback failed", error?.message || error);
           failedRoute = route;
           recordTakeoverFailure(route, "mse", error, true);
           setTimeout(() => {
@@ -1069,6 +1087,7 @@
         return;
       }
       player = nextPlayer;
+      remember("took over", `${route}${nextPlayer.nativeTransport ? " (兼容模式)" : ""}`);
       stats.architecture = nextPlayer.nativeTransport ? "native-player-range-transport" : "bilibili-native-ui-progressive-mse-0.8-core";
       playerRoute = route;
       playerContainer = container;
@@ -1204,11 +1223,11 @@
         const { timeline = [], ...rest } = debug;
         // Node names and states only: no download address or account data.
         return JSON.stringify({
-          version: stats.version, at: Math.round(performance.now()), settings: { mode: settings.mode, customHosts: settings.customHosts.slice(), concurrency: settings.concurrency, codec: nativeCodec() || "default" },
-          state: stats.playerState, player: rest, nodes: stats.cdnHosts.map((item) => ({ ...item })), bannedNodes: cdnBans?.hosts?.() || [], timeline
+          version: stats.version, at: Math.round(performance.now()), settings: { takeover: settings.takeover, mode: settings.mode, customHosts: settings.customHosts.slice(), concurrency: settings.concurrency, codec: nativeCodec() || "default" },
+          state: stats.playerState, lastError: stats.lastError, player: rest, nodes: stats.cdnHosts.map((item) => ({ ...item })), bannedNodes: cdnBans?.hosts?.() || [], page: pageEvents.slice(), timeline
         }, null, 1);
       },
-      version: "0.9.2.2"
+      version: "0.9.2.3"
     })
   });
   publish();
