@@ -301,10 +301,21 @@
     return /^BV[0-9A-Za-z]+$/i.test(value) ? value : "";
   }
 
-  function routeIdentity() {
+  function urlPathId() {
     const match = /\/video\/(BV[0-9A-Za-z]+|av\d+)/i.exec(location.pathname);
-    if (!match) return null;
-    const pathId = match[1];
+    if (match) return match[1];
+
+    if (/^\/list\//i.test(location.pathname)) {
+      const bvid = new URLSearchParams(location.search).get("bvid") || "";
+      if (/^BV[0-9A-Za-z]+$/i.test(bvid)) return bvid;
+    }
+
+    return "";
+  }
+
+  function routeIdentity() {
+    const pathId = urlPathId();
+    if (!pathId) return null;
     const podBvid = activePodBvid();
     const pathVideoKey = /^BV/i.test(pathId) ? pathId.toLowerCase() : `av${Number(pathId.slice(2)) || 0}`;
     const podVideoKey = podBvid ? podBvid.toLowerCase() : "";
@@ -1137,10 +1148,7 @@
 
   const nativePushState = history.pushState.bind(history);
   const nativeReplaceState = history.replaceState.bind(history);
-  const pathVideoKey = () => {
-    const match = /\/video\/(BV[0-9A-Za-z]+|av\d+)/i.exec(location.pathname);
-    return String(match?.[1] || "").toLowerCase();
-  };
+  const pathVideoKey = () => urlPathId().toLowerCase();
   history.pushState = function (...args) {
     const previousPathVideoKey = pathVideoKey();
     const result = nativePushState(...args);
