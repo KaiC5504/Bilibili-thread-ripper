@@ -101,6 +101,24 @@
   }
   const endDebug = root.__nativeMseTestPlayer.getDebug();
   const endDuration = Number(video.duration) || 0;
+  // Issue #17: the player's 单集循环 and its replay button only send the ended video back to
+  // its start; it has to play again by itself. A seek while paused anywhere else must not.
+  // This starts a new session, so the state of the ended one is read above.
+  const loop = { ranAgain: false, stayedPaused: null };
+  if (endedFired && !probe.errors.length) {
+    video.currentTime = 0;
+    const loopStartedAt = Date.now();
+    while (Date.now() - loopStartedAt < 25000 && !probe.errors.length) {
+      if (!video.paused && Number(video.currentTime) > 0.5) { loop.ranAgain = true; break; }
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+    video.pause();
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    video.currentTime = Math.max(0, endTarget - 30);
+    const pausedStartedAt = Date.now();
+    while (Date.now() - pausedStartedAt < 8000 && video.paused) await new Promise((resolve) => setTimeout(resolve, 200));
+    loop.stayedPaused = video.paused;
+  }
   // Bilibili's own toasts stay visible; its error panel is hidden only while BTR plays and
   // what it said is in the log.
   const shown = (selector) => getComputedStyle(document.querySelector(selector)).display !== "none";
@@ -131,6 +149,7 @@
     requestedCodec: query.get("codec") || "",
     endTarget,
     endedFired,
+    loop,
     endMediaSourceState: endDebug.mediaSourceState,
     endDuration,
     durationRefusals: root.__durationRefusals || 0,
@@ -155,6 +174,8 @@
     && output.seekReloads >= 1
     && (!output.requestedCodec || output.codec === output.requestedCodec)
     && output.endedFired
+    && output.loop.ranAgain
+    && output.loop.stayedPaused === true
     && output.endMediaSourceState === "ended"
     && output.durationRefusals === 0
     && output.nativeLayers.toastVisible

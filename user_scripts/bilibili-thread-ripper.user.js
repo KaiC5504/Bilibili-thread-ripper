@@ -1431,6 +1431,7 @@ const chrome = (() => {
     let seekSettledAt = 0;
     let lastSeekMs = 0;
     let stallsAfterSeek = 0;
+    let endedAt = 0;
     // The initialization segment and the index of a representation never change, and a seek
     // outside the buffer starts a new session for the same one. Asking for them again cost
     // every such seek a round trip to the CDN before any media could be requested.
@@ -1908,9 +1909,13 @@ const chrome = (() => {
       seekStartedAt = seekRequestedAt || performance.now();
       note("seek outside the buffer", target.toFixed(1));
       options.onLog?.("你跳到的位置还需要加载", `正在为 ${target.toFixed(2)} 秒的位置重新准备数据。`, "info", "buffer");
+      // A video sent back to its start right after it ended is the player's 单集循环 or its
+      // replay button, which mean to play it again. The video is paused at that moment, so
+      // without this the next round would stop at the first frame (issue #17).
+      const restarting = target < 1 && (video.ended || performance.now() - endedAt < 2000);
       await startSession(selectedVideo, {
         time: target,
-        resume: !video.paused,
+        resume: !video.paused || restarting,
         volume: video.volume,
         muted: video.muted,
         playbackRate: video.playbackRate
@@ -1946,7 +1951,10 @@ const chrome = (() => {
     }, { signal: eventController.signal });
     video.addEventListener("playing", clearNativeErrorOverlay, { signal: eventController.signal });
     video.addEventListener("playing", () => note("playing"), { signal: eventController.signal });
-    video.addEventListener("ended", () => publishState({ playerState: "ended", bufferedAhead: 0 }), { signal: eventController.signal });
+    video.addEventListener("ended", () => {
+      endedAt = performance.now();
+      publishState({ playerState: "ended", bufferedAhead: 0 });
+    }, { signal: eventController.signal });
 
     function playbackState() {
       return {
