@@ -184,7 +184,7 @@ test("a node that delivers one address keeps being used after refusing another t
 test("pieces grow with the speed of the fastest node, so a far but fast node is not judged by its round trip",()=>{
   const {cdn}=load();
   const nodeStats=cdn.createNodeStats();
-  const resolver=cdn.createResolver({baseUrl:mediaUrl("upos-sz-mirrorcosov.bilivideo.com")},()=> "overseas",null,nodeStats);
+  const resolver=cdn.createResolver({baseUrl:mediaUrl("upos-sz-mirrorcosov.bilivideo.com")},()=> "overseas",null,null,nodeStats);
   assert.equal(resolver.pieceBytes(65536),65536,"nothing measured yet: the old 64 KiB");
   const far=mediaUrl("upos-sz-mirrorcosov.bilivideo.com"),near=mediaUrl("upos-sz-mirroraliov.bilivideo.com");
   nodeStats.begin(far);nodeStats.firstByte(far,370);nodeStats.body(far,1024*1024,300);nodeStats.end(far,true);

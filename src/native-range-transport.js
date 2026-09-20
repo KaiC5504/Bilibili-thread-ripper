@@ -501,7 +501,7 @@
         const parsed = new URL(url), key = parsed.pathname + parsed.search;
         if (!cache.has(key)) {
           if (cache.size >= 64) cache.delete(cache.keys().next().value);
-          cache.set(key, resolvers.createResolver({ ...track.representation, baseUrl: url, base_url: url }, () => settings().mode, options.cdnBans, () => settings().customHosts));
+          cache.set(key, resolvers.createResolver({ ...track.representation, baseUrl: url, base_url: url }, () => settings().mode, options.cdnBans, () => settings().customHosts, options.nodeStats || undefined));
         }
         return cache.get(key);
       },
