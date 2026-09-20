@@ -2,7 +2,7 @@
   "use strict";
 
   const CHANNEL = "__BILI_RANGE_ACCELERATOR_V1__";
-  const VERSION = "0.9.2.0";
+  const VERSION = "0.9.2.1";
   const notices = globalThis.__BTR_NOTIFICATION_VIEW__;
   const ERROR_NOTICE_ID = "__bilibili_thread_ripper_error_notice__";
   const ERROR_NOTICE_STYLE_ID = "__bilibili_thread_ripper_error_notice_style__";
@@ -11,7 +11,7 @@
   const ONBOARDING_STORAGE_KEY = "btrOnboardingRevision";
   const ONBOARDING_REVISION = "native-progressive-mse-v1";
   const THREAD_OPTIONS = Object.freeze([4, 8, 16, 32, 64, 128]);
-  const DEFAULTS = { enabled: true, concurrency: 8, mode: "mainland", customHosts: [], debugNotices: false, errorNotices: false, debugCategories: {} };
+  const DEFAULTS = { enabled: true, concurrency: 8, takeover: "full", mode: "mainland", customHosts: [], debugNotices: false, errorNotices: false, debugCategories: {} };
   // Settings of the old ArtPlayer version and of the removed compatibility modes.
   const RETIRED_KEYS = ["statusNotice", "compatibilityMode", "volume", "danmaku", "danmakuFontSize", "subtitleLanguage", "subtitleLastLanguage"];
   let latestSettings = { ...DEFAULTS };
@@ -54,6 +54,7 @@
       #${ONBOARDING_ID} .btr-onboarding-mode input:focus-visible+.btr-onboarding-mode-body{outline:2px solid #00aeec!important;outline-offset:2px!important}
       #${ONBOARDING_ID} .btr-onboarding-mode-name{display:block!important;margin:0 0 5px!important;font-size:14px!important;line-height:20px!important;font-weight:600!important}
       #${ONBOARDING_ID} .btr-onboarding-mode-note{display:block!important;color:#9499a0!important;font-size:12px!important;line-height:18px!important;font-weight:400!important}
+      #${ONBOARDING_ID} .btr-onboarding-hint{margin:8px 0 0!important;color:#9499a0!important;font-size:12px!important;line-height:18px!important}
       #${ONBOARDING_ID} .btr-onboarding-thread-head{display:flex!important;align-items:center!important;justify-content:space-between!important;margin:0 0 6px!important}
       #${ONBOARDING_ID} .btr-onboarding-thread-value{color:#fb7299!important;font-size:22px!important;line-height:28px!important;font-weight:700!important;font-variant-numeric:tabular-nums!important}
       #${ONBOARDING_ID} input[type="range"]{display:block!important;width:100%!important;height:24px!important;margin:0!important;accent-color:#fb7299!important;cursor:pointer!important}
@@ -91,35 +92,51 @@
     lead.className = "btr-onboarding-lead";
     lead.textContent = "首次使用请完成加速设置。播放器、弹幕和字幕仍由 B 站原生功能负责，线程撕裂者只优化视频传输。";
 
+    // Two cards to pick from, as for the CDN mode and the takeover mode.
+    const cardList = (inputName, options, selected) => {
+      const list = document.createElement("div");
+      list.className = "btr-onboarding-mode-list";
+      for (const option of options) {
+        const label = document.createElement("label");
+        label.className = "btr-onboarding-mode";
+        const input = document.createElement("input");
+        input.type = "radio";
+        input.name = inputName;
+        input.value = option.value;
+        input.checked = option.value === selected;
+        const body = document.createElement("span");
+        body.className = "btr-onboarding-mode-body";
+        const name = document.createElement("span");
+        name.className = "btr-onboarding-mode-name";
+        name.textContent = option.name;
+        const note = document.createElement("span");
+        note.className = "btr-onboarding-mode-note";
+        note.textContent = option.note;
+        body.append(name, note);
+        label.append(input, body);
+        list.append(label);
+      }
+      return list;
+    };
+
     const modeFieldset = document.createElement("fieldset");
     const modeLegend = document.createElement("legend");
     modeLegend.textContent = "CDN 模式";
-    const modeList = document.createElement("div");
-    modeList.className = "btr-onboarding-mode-list";
-    for (const option of [
+    modeFieldset.append(modeLegend, cardList("btr-onboarding-mode", [
       { value: "mainland", name: "大陆 CDN（推荐）", note: "优先使用大陆 bilivideo 节点" },
       { value: "overseas", name: "海外 CDN", note: "优先使用海外及镜像节点" }
-    ]) {
-      const label = document.createElement("label");
-      label.className = "btr-onboarding-mode";
-      const input = document.createElement("input");
-      input.type = "radio";
-      input.name = "btr-onboarding-mode";
-      input.value = option.value;
-      input.checked = option.value === latestSettings.mode;
-      const body = document.createElement("span");
-      body.className = "btr-onboarding-mode-body";
-      const name = document.createElement("span");
-      name.className = "btr-onboarding-mode-name";
-      name.textContent = option.name;
-      const note = document.createElement("span");
-      note.className = "btr-onboarding-mode-note";
-      note.textContent = option.note;
-      body.append(name, note);
-      label.append(input, body);
-      modeList.append(label);
-    }
-    modeFieldset.append(modeLegend, modeList);
+    ], latestSettings.mode));
+
+    const takeoverFieldset = document.createElement("fieldset");
+    const takeoverLegend = document.createElement("legend");
+    takeoverLegend.textContent = "接管方式";
+    const takeoverHint = document.createElement("p");
+    takeoverHint.className = "btr-onboarding-hint";
+    takeoverHint.textContent = "Safari 用户建议使用兼容模式。以后可以在设置面板里随时改。";
+    takeoverFieldset.append(takeoverLegend, cardList("btr-onboarding-takeover", [
+      { value: "full", name: "全接管（推荐）", note: "视频由插件自己来放，什么时候下、下多少都由插件安排，效果最好" },
+      { value: "compat", name: "兼容模式", note: "还是 B 站自己的播放器在放，插件只帮它多线程下载，换清晰度交给 B 站，更不容易出问题" }
+    ], latestSettings.takeover), takeoverHint);
 
     const threadFieldset = document.createElement("fieldset");
     const threadHead = document.createElement("div");
@@ -165,11 +182,12 @@
     status.setAttribute("aria-live", "polite");
     save.addEventListener("click", () => {
       const mode = panel.querySelector('input[name="btr-onboarding-mode"]:checked')?.value === "overseas" ? "overseas" : "mainland";
+      const takeover = panel.querySelector('input[name="btr-onboarding-takeover"]:checked')?.value === "compat" ? "compat" : "full";
       const concurrency = THREAD_OPTIONS[Number(threadRange.value)] || 8;
       save.disabled = true;
       save.textContent = "正在保存…";
-      latestSettings = normalizeStoredSettings({ ...latestSettings, enabled: true, mode, concurrency });
-      chrome.storage.sync.set({ enabled: true, mode, concurrency }, () => {
+      latestSettings = normalizeStoredSettings({ ...latestSettings, enabled: true, mode, takeover, concurrency });
+      chrome.storage.sync.set({ enabled: true, mode, takeover, concurrency }, () => {
         if (chrome.runtime.lastError) {
           status.textContent = `保存失败：${chrome.runtime.lastError.message}`;
           save.disabled = false;
@@ -192,7 +210,7 @@
       });
     });
 
-    panel.append(heading, lead, modeFieldset, threadFieldset, tip, save, status);
+    panel.append(heading, lead, modeFieldset, takeoverFieldset, threadFieldset, tip, save, status);
     overlay.append(panel);
     mount.append(overlay);
     save.focus({ preventScroll: true });
@@ -214,6 +232,7 @@
     return {
       enabled: input?.enabled !== false,
       concurrency: THREAD_OPTIONS.includes(threads) ? threads : 8,
+      takeover: input?.takeover === "compat" ? "compat" : "full",
       mode: ["overseas", "custom"].includes(input?.mode) ? input.mode : "mainland",
       customHosts: (Array.isArray(input?.customHosts) ? input.customHosts : [])
         .map((host) => String(host).trim().toLowerCase())

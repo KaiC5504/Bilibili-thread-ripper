@@ -81,6 +81,14 @@ const settingsOf = page => page.evaluate(() => __biliThreadRipperDebug.getSettin
     assert.equal(await panel.locator('input[name="mode"][value="mainland"]').isChecked(), true);
     assert.equal(await panel.locator('input[name="mode"]').count(), 3);
     assert.equal(await panel.locator("#custom-hosts").isVisible(), false);
+    // The takeover switch sits where the old compatibility modes were, full takeover by
+    // default, with the note for Safari users under it.
+    assert.equal(await panel.locator('input[name="takeover"][value="full"]').isChecked(), true);
+    assert.match(await panel.locator(".takeover-note").textContent(), /Safari 用户建议使用兼容模式/);
+    await panel.locator('input[name="takeover"][value="compat"]').check({ force: true });
+    await page.waitForFunction(() => __biliThreadRipperDebug.getSettings().takeover === "compat");
+    await panel.locator('input[name="takeover"][value="full"]').check({ force: true });
+    await page.waitForFunction(() => __biliThreadRipperDebug.getSettings().takeover === "full");
     assert.equal(await panel.locator("#thread-value").textContent(), "8");
     assert.equal(await panel.locator("#error-notices").isChecked(), false);
     assert.equal(await panel.locator("#debug-filters").isVisible(), false);

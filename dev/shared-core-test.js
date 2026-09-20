@@ -223,6 +223,8 @@ test("the custom CDN mode uses only the servers picked in the settings, and only
   assert.equal(settings.mode,"custom");
   assert.deepEqual(Array.from(settings.customHosts),["upos-sz-mirrorcos.bilivideo.com","cn-gdfs-ct-01-01.bilivideo.com"]);
   assert.equal(core.normalizeSettings({mode:"somewhere"}).mode,"mainland");
+  // The takeover mode: full replaces the playback core, compat only downloads for it.
+  assert.equal(core.normalizeSettings({}).takeover,"full");assert.equal(core.normalizeSettings({takeover:"compat"}).takeover,"compat");assert.equal(core.normalizeSettings({takeover:"a"}).takeover,"full");
   const hostsOf=list=>Array.from(list,url=>new URL(url).hostname);
   let hosts=Array.from(settings.customHosts);
   const resolver=cdn.createResolver({baseUrl:mediaUrl("upos-sz-mirrorali.bilivideo.com")},()=>"custom",null,()=>hosts);

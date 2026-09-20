@@ -62,7 +62,7 @@
   let transferSequence = 1;
   const transfers = new Map();
   const stats = {
-    version: "0.9.2.0",
+    version: "0.9.2.1",
     architecture: "bilibili-native-ui-progressive-mse-0.8-core",
     mode: settings.mode,
     playerState: "waiting",
@@ -467,15 +467,12 @@
     xhrPrototype.send = function (...args) {
       const url = xhrUrls.get(this) || "";
       if (/\/x\/player\/(?:wbi\/)?playurl/i.test(url)) {
-        const context = xhrContexts.get(this);
-        const observe = () => {
+        this.addEventListener("load", () => {
           try {
             const payload = this.responseType === "json" ? this.response : JSON.parse(this.responseText);
-            observePlayinfo(this.responseURL || url, payload, context);
+            observePlayinfo(this.responseURL || url, payload, xhrContexts.get(this));
           } catch (_error) {}
-        };
-        this.addEventListener("load", observe, { once: true });
-        this.addEventListener("loadend", () => this.removeEventListener("load", observe), { once: true });
+        }, { once: true });
       }
       return nativeXhrSend.apply(this, args);
     };
@@ -743,6 +740,7 @@
   }
 
   function syncNativeQuality() {
+    // In the compatibility mode Bilibili's own player owns quality and codec.
     if (player?.nativeTransport) return;
     const wanted = nativeQuality();
     if (!player?.setQuality || (qualityPlayer === player && syncedQuality === wanted)) return;
@@ -828,14 +826,14 @@
   // rows show what BTR plays and downloads instead.
   function nativeInfoValues() {
     const info = player?.getDebug?.();
+    // In the compatibility mode the native core knows the codec, resolution and segments;
+    // only the download rows belong to BTR.
     if (player?.nativeTransport) {
       if (!player.transportActive) return null;
       const now = Date.now();
       while (recentBytes.length && now - recentBytes[0].at > 1000) recentBytes.shift();
-      // The native core knows the rendered codec, resolution and segment index.
-      // Override only transport data: its original URL cannot describe our CDN pieces.
       return {
-        "Player Type": "BTR Native",
+        "Player Type": "BTR Native (兼容模式)",
         "Video Host": lastHostByKind.video || undefined,
         "Audio Host": lastHostByKind.audio || undefined,
         "Video Speed": `${measuredSpeed("video", now)} Kbps`,
@@ -892,7 +890,6 @@
     }
     const identity = routeIdentity();
     if (!settings.enabled || !identity) {
-      nativeCoreWait = null;
       pendingPodSwitch = null;
       clearTakeoverFailure();
       stats.lastError = "";
@@ -918,27 +915,23 @@
     if (player && playerRoute === route && playerContainer?.isConnected && player.video?.isConnected) return;
     if (startingRoute === route) return;
     const container = findContainer();
-    if (!container) {
-      nativeCoreWait = null;
-      stats.playerState = stats.takeoverError?.route === route ? "error" : "waiting";
-      schedulePublish();
-      restartTimer = setTimeout(startPlayer, 350);
-      return;
-    }
-    const transport = root.__BILI_NATIVE_RANGE_PLAYER_FACTORY__;
-    const nativeVideo = container.querySelector("video");
-    // Allow asynchronous native initialization, but do not wait forever on an
-    // unsupported core. Each route/video gets its own bounded initialization wait.
-    if (transport && !transport.supports(container) && nativeVideo?.readyState === 0) {
-      if (nativeCoreWait?.route !== route || nativeCoreWait.video !== nativeVideo) {
-        nativeCoreWait = { route, video: nativeVideo, at: Date.now() };
-      }
+    // Bilibili's playback core appears a moment after its player. The compatibility mode
+    // needs it, so each video waits briefly for it instead of falling back at once.
+    const rangeTransport = settings.takeover === "compat" ? root.__BILI_NATIVE_RANGE_PLAYER_FACTORY__ : null;
+    if (container && rangeTransport && !rangeTransport.supports(container)) {
+      if (nativeCoreWait?.route !== route) nativeCoreWait = { route, at: Date.now() };
       if (Date.now() - nativeCoreWait.at < 3000) {
-        restartTimer = setTimeout(startPlayer, 350);
+        restartTimer = setTimeout(startPlayer, 250);
         return;
       }
     } else {
       nativeCoreWait = null;
+    }
+    if (!container) {
+      stats.playerState = stats.takeoverError?.route === route ? "error" : "waiting";
+      schedulePublish();
+      restartTimer = setTimeout(startPlayer, 350);
+      return;
     }
     const generation = routeGeneration;
     let playinfo = currentPlayinfo(identity);
@@ -980,7 +973,10 @@
     const resumeAfterStop = takeResumeHint();
     for (const meter of Object.values(speedMeters)) meter.shown = 0;
     try {
-      const factory = transport?.supports(container) ? transport : root.__BILI_NATIVE_MSE_PLAYER_FACTORY__;
+      // The compatibility mode needs Bilibili's own playback core; without it the video is
+      // taken over as usual.
+      const transport = settings.takeover === "compat" ? root.__BILI_NATIVE_RANGE_PLAYER_FACTORY__ : null;
+      const factory = transport?.supports(container) ? transport : playerFactory;
       const nextPlayer = factory.createNativePlayer({
         container,
         identity,
@@ -1062,7 +1058,7 @@
         return;
       }
       player = nextPlayer;
-      stats.architecture = player.nativeTransport ? "native-player-range-transport" : "bilibili-native-ui-progressive-mse-0.8-core";
+      stats.architecture = nextPlayer.nativeTransport ? "native-player-range-transport" : "bilibili-native-ui-progressive-mse-0.8-core";
       playerRoute = route;
       playerContainer = container;
       qualityPlayer = nextPlayer;
@@ -1103,11 +1099,11 @@
       settingsLoaded = true;
       notices?.configure(settings);
       const serversChanged = settings.mode === "custom" && previous.customHosts.join(",") !== settings.customHosts.join(",");
-      if (!hadLoadedSettings || previous.enabled !== settings.enabled || previous.mode !== settings.mode || previous.concurrency !== settings.concurrency || serversChanged) {
+      if (!hadLoadedSettings || previous.enabled !== settings.enabled || previous.takeover !== settings.takeover || previous.mode !== settings.mode || previous.concurrency !== settings.concurrency || serversChanged) {
         const cdn = settings.mode === "overseas" ? "海外 CDN"
           : settings.mode !== "custom" ? "大陆 CDN"
             : settings.customHosts.length ? `自定义的 ${settings.customHosts.length} 个服务器` : "大陆 CDN（自定义里还没选服务器）";
-        notices?.log("设置已经生效", `使用${cdn}，开启 ${settings.concurrency} 条下载线程。`, "success", "", undefined, "settings");
+        notices?.log("设置已经生效", `${settings.takeover === "compat" ? "兼容模式" : "全接管"}，使用${cdn}，开启 ${settings.concurrency} 条下载线程。`, "success", "", undefined, "settings");
       }
       stats.mode = settings.mode;
       syncSettingsMenu();
@@ -1116,7 +1112,7 @@
         stats.lastError = "";
         stopPlayer(true);
       }
-      else if (!previous.enabled) {
+      else if (!previous.enabled || previous.takeover !== settings.takeover) {
         restartPlayer(true);
       }
       else {
@@ -1204,7 +1200,7 @@
           state: stats.playerState, player: rest, nodes: stats.cdnHosts.map((item) => ({ ...item })), bannedNodes: cdnBans?.hosts?.() || [], timeline
         }, null, 1);
       },
-      version: "0.9.2.0"
+      version: "0.9.2.1"
     })
   });
   publish();

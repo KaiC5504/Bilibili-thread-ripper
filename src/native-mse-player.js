@@ -838,7 +838,7 @@
       updatePlayinfo,
       video,
       getDebug: () => ({
-        version: "0.9.2.0",
+        version: "0.9.2.1",
         architecture: "bilibili-native-ui-progressive-mse-0.8-core",
         quality: qualityLabel(selectedVideo),
         qualityId: Number(selectedVideo?.id) || 0,

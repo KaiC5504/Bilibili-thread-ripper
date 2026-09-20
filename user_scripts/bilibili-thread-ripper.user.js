@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili 线程撕裂者
 // @namespace    https://github.com/MrTangLuyao/Bilibili-thread-ripper
-// @version      0.9.2.0
+// @version      0.9.2.1
 // @description  保留哔哩哔哩原生播放器，通过多 CDN、多 Range 并发下载改善视频缓冲速度。
 // @author       MrTangLuyao
 // @license      MIT
@@ -210,6 +210,9 @@ const chrome = (() => {
     const requested = Math.trunc(Number(source.concurrency));
     return {
       enabled: source.enabled !== false,
+      // "full" replaces Bilibili's playback core; "compat" leaves it in charge and only
+      // downloads its media requests.
+      takeover: source.takeover === "compat" ? "compat" : "full",
       mode: ["overseas", "custom"].includes(source.mode) ? source.mode : "mainland",
       customHosts: (Array.isArray(source.customHosts) ? source.customHosts : [])
         .map(normalizeCdnHost)
@@ -2059,7 +2062,7 @@ const chrome = (() => {
       updatePlayinfo,
       video,
       getDebug: () => ({
-        version: "0.9.2.0",
+        version: "0.9.2.1",
         architecture: "bilibili-native-ui-progressive-mse-0.8-core",
         quality: qualityLabel(selectedVideo),
         qualityId: Number(selectedVideo?.id) || 0,
@@ -2104,13 +2107,12 @@ const chrome = (() => {
   const downloaders = root.__BILI_IDM_DOWNLOADER_FACTORY__;
   if (!core || !resolvers || !downloaders || !root.fetch || !root.XMLHttpRequest) return;
   const nativeFetch = root.fetch.bind(root);
-  // Other browsers keep the existing MSE engine. Safari needs the native
-  // decoder/buffer lifecycle to switch renditions without replacing MediaSource.
-  const safari = /Macintosh/.test(root.navigator?.userAgent || "")
-    && /Version\/.*Safari\//.test(root.navigator?.userAgent || "")
-    && !/(Chrome|Chromium|Edg|OPR|FxiOS|CriOS)\//.test(root.navigator?.userAgent || "");
-  if (!safari) return;
+  // The compatibility mode ("兼容模式" in the settings): Bilibili's own player keeps the
+  // decoder, the buffer and the quality switching, and only its media requests are
+  // downloaded here. Safari needs it, because replacing the MediaSource breaks its quality
+  // switching. Nothing is intercepted until a player of this mode is created.
   let active = null;
+  let passthroughFetch = nativeFetch;
 
   function nativeCore(video) {
     const wrapper = root.player?.__core?.(), dash = wrapper?.getCorePlayer?.();
@@ -2350,29 +2352,29 @@ const chrome = (() => {
     return response;
   }
 
-  root.fetch = function (input, init) {
+  function interceptedFetch(input, init) {
     const url = input instanceof Request ? input.url : String(input);
     const method = String(init?.method || (input instanceof Request ? input.method : "GET")).toUpperCase();
-    if (!active || method !== "GET" || !core.isBilibiliMediaUrl(url)) return nativeFetch(input, init);
+    if (!active || method !== "GET" || !core.isBilibiliMediaUrl(url)) return passthroughFetch(input, init);
     let request;
     try { request = new Request(input instanceof Request ? input : new URL(String(input), root.location.href), init); }
-    catch (_error) { return nativeFetch(input, init); }
+    catch (_error) { return passthroughFetch(input, init); }
     const plan = request.mode === "no-cors" || request.integrity ? null
       : planRequest(request.url, request.method, request.headers, request.credentials);
-    if (!plan) return nativeFetch(input, init);
+    if (!plan) return passthroughFetch(input, init);
     return download(plan, request.signal).then(({ bytes, headers }) => {
       if (request.signal.aborted) throw request.signal.reason;
       return responseURL(new Response(bytes, { status: 206, statusText: "Partial Content", headers }), request.url);
     });
-  };
+  }
 
   // Preserve the actual XMLHttpRequest object, event handlers and prototype. Only
   // eligible arraybuffer requests receive a synthetic response. Calling open()
   // again restores all native response accessors before the object is reused.
   const proto = root.XMLHttpRequest.prototype;
-  const nativeOpen = proto.open, nativeSend = proto.send, nativeAbort = proto.abort;
-  const nativeSetHeader = proto.setRequestHeader;
-  const nativeGetHeader = proto.getResponseHeader, nativeGetHeaders = proto.getAllResponseHeaders;
+  // Taken when the interception is installed, so anything already wrapping fetch or
+  // XMLHttpRequest (the playurl reader of page-hook.js) stays in the chain.
+  let nativeOpen, nativeSend, nativeAbort, nativeSetHeader, nativeGetHeader, nativeGetHeaders;
   const requests = new WeakMap();
   const fields = ["readyState", "status", "statusText", "response", "responseText", "responseURL"];
   function emit(xhr, type, progress) {
@@ -2399,7 +2401,7 @@ const chrome = (() => {
     emit(xhr, type, progress);
     if (requests.get(xhr) === entry) emit(xhr, "loadend", progress);
   }
-  proto.open = function (method, url, async = true, ...rest) {
+  const patchedOpen = function (method, url, async = true, ...rest) {
     const previous = requests.get(this);
     requests.delete(this);
     if (previous) {
@@ -2413,22 +2415,22 @@ const chrome = (() => {
       async: async !== false, headers: new Headers(), authenticated: rest.some(value => value != null), sending: false, synthetic: false });
     return result;
   };
-  proto.setRequestHeader = function (name, value) {
+  const patchedSetRequestHeader = function (name, value) {
     const entry = requests.get(this);
     if (entry?.synthetic) throw new DOMException("Call open() before sending again", "InvalidStateError");
     const result = nativeSetHeader.call(this, name, value);
     entry?.headers.append(name, value);
     return result;
   };
-  proto.getResponseHeader = function (name) {
+  const patchedGetResponseHeader = function (name) {
     const entry = requests.get(this);
     return entry?.synthetic ? (entry.state >= 2 ? entry.responseHeaders.get(name) : null) : nativeGetHeader.call(this, name);
   };
-  proto.getAllResponseHeaders = function () {
+  const patchedGetAllResponseHeaders = function () {
     const entry = requests.get(this);
     return entry?.synthetic ? (entry.state >= 2 ? [...entry.responseHeaders].map(([key, value]) => `${key}: ${value}\r\n`).join("") : "") : nativeGetHeaders.call(this);
   };
-  proto.abort = function () {
+  const patchedAbort = function () {
     const entry = requests.get(this);
     if (!entry?.synthetic) return nativeAbort.call(this);
     entry.status = 0; entry.statusText = ""; entry.responseUrl = ""; entry.body = null; entry.responseHeaders = new Headers();
@@ -2438,7 +2440,7 @@ const chrome = (() => {
     }
     if (requests.get(this) === entry && !entry.sending) entry.state = 0;
   };
-  proto.send = function (body) {
+  const patchedSend = function (body) {
     const entry = requests.get(this);
     if (entry?.synthetic) throw new DOMException("Call open() before sending again", "InvalidStateError");
     if (this.readyState !== 1) return nativeSend.call(this, body);
@@ -2490,9 +2492,32 @@ const chrome = (() => {
     });
   };
 
+  // Only a player of this mode installs the interception, and what is in place then keeps
+  // working under it. The other mode never sees any of this.
+  let intercepting = false;
+  function installInterception() {
+    if (intercepting) return;
+    intercepting = true;
+    passthroughFetch = root.fetch.bind(root);
+    nativeOpen = proto.open;
+    nativeSend = proto.send;
+    nativeAbort = proto.abort;
+    nativeSetHeader = proto.setRequestHeader;
+    nativeGetHeader = proto.getResponseHeader;
+    nativeGetHeaders = proto.getAllResponseHeaders;
+    root.fetch = interceptedFetch;
+    proto.open = patchedOpen;
+    proto.setRequestHeader = patchedSetRequestHeader;
+    proto.getResponseHeader = patchedGetResponseHeader;
+    proto.getAllResponseHeaders = patchedGetAllResponseHeaders;
+    proto.abort = patchedAbort;
+    proto.send = patchedSend;
+  }
+
   function createNativePlayer(options) {
     const video = options.container.querySelector("video");
     if (!video) throw new Error("没有找到 B 站原生 video 元素");
+    installInterception();
     if (active) active.destroy();
     let tracks = [], lastVideo = null, lastAudio = null;
     let delivered = 0, failures = 0, nativeSwitchRequests = 0;
@@ -2861,6 +2886,12 @@ const chrome = (() => {
         <p class="custom-note">只能填 B 站的视频服务器（bilivideo.com、akamaized.net 等），视频的下载地址不会发给别的网站。</p>
       </section>
 
+      <section class="takeover-select" aria-label="接管方式">
+        <label><input type="radio" name="takeover" value="full"><span>全接管</span></label>
+        <label><input type="radio" name="takeover" value="compat"><span>兼容模式</span></label>
+      </section>
+      <p class="takeover-note">Safari 用户建议使用兼容模式。<br>全接管：视频由插件自己来放，什么时候下、下多少都由插件安排，效果最好。<br>兼容模式：还是 B 站自己的播放器在放，插件只帮它多线程下载，换清晰度这些都交给 B 站，更不容易出问题。</p>
+
       <section class="controls">
         <div class="control-title">
           <label for="concurrency">线程加载数</label>
@@ -2919,6 +2950,13 @@ const chrome = (() => {
     .mode-select span { display: block; padding: 10px 6px; color: #949baa; background: #20232a; font-size: 12px; text-align: center; cursor: pointer; }
     .mode-select input:checked + span { color: #fff; background: #fb7299; }
     .mode-select input:focus-visible + span { outline: 2px solid #fff; outline-offset: -3px; }
+    .takeover-select { display: grid; grid-template-columns: repeat(2, 1fr); gap: 1px; margin-bottom: 8px; overflow: hidden; border: 1px solid #30343d; border-radius: 8px; background: #30343d; }
+    .takeover-select label { position: relative; }
+    .takeover-select input { position: absolute; opacity: 0; }
+    .takeover-select span { display: block; padding: 10px 6px; color: #949baa; background: #20232a; font-size: 12px; text-align: center; cursor: pointer; }
+    .takeover-select input:checked + span { color: #fff; background: #fb7299; }
+    .takeover-select input:focus-visible + span { outline: 2px solid #fff; outline-offset: -3px; }
+    .takeover-note { margin: 0 0 12px; padding: 0 2px; color: #7f8797; font-size: 11px; line-height: 1.6; }
     .custom-hosts { margin-bottom: 12px; padding: 14px 16px; border: 1px solid #30343d; border-radius: 8px; background: #20232a; }
     .custom-hosts[hidden] { display: none; }
     .custom-head { display: flex; align-items: center; justify-content: space-between; color: #c9ced9; font-size: 13px; }
@@ -3087,6 +3125,7 @@ const chrome = (() => {
 
     function render(settings) {
       enabled.checked = settings.enabled;
+      for (const radio of shadow.querySelectorAll('input[name="takeover"]')) radio.checked = radio.value === settings.takeover;
       setSlider(settings.concurrency);
       setMode(settings.mode);
       customHosts = settings.customHosts;
@@ -3110,6 +3149,9 @@ const chrome = (() => {
         setMode(radio.value);
         save({ mode: radio.value });
       });
+    }
+    for (const radio of shadow.querySelectorAll('input[name="takeover"]')) {
+      radio.addEventListener("change", () => { if (radio.checked) save({ takeover: radio.value }); });
     }
     $("known-hosts").addEventListener("change", (event) => {
       const input = event.target;
@@ -3267,7 +3309,7 @@ const chrome = (() => {
   let transferSequence = 1;
   const transfers = new Map();
   const stats = {
-    version: "0.9.2.0",
+    version: "0.9.2.1",
     architecture: "bilibili-native-ui-progressive-mse-0.8-core",
     mode: settings.mode,
     playerState: "waiting",
@@ -3672,15 +3714,12 @@ const chrome = (() => {
     xhrPrototype.send = function (...args) {
       const url = xhrUrls.get(this) || "";
       if (/\/x\/player\/(?:wbi\/)?playurl/i.test(url)) {
-        const context = xhrContexts.get(this);
-        const observe = () => {
+        this.addEventListener("load", () => {
           try {
             const payload = this.responseType === "json" ? this.response : JSON.parse(this.responseText);
-            observePlayinfo(this.responseURL || url, payload, context);
+            observePlayinfo(this.responseURL || url, payload, xhrContexts.get(this));
           } catch (_error) {}
-        };
-        this.addEventListener("load", observe, { once: true });
-        this.addEventListener("loadend", () => this.removeEventListener("load", observe), { once: true });
+        }, { once: true });
       }
       return nativeXhrSend.apply(this, args);
     };
@@ -3948,6 +3987,7 @@ const chrome = (() => {
   }
 
   function syncNativeQuality() {
+    // In the compatibility mode Bilibili's own player owns quality and codec.
     if (player?.nativeTransport) return;
     const wanted = nativeQuality();
     if (!player?.setQuality || (qualityPlayer === player && syncedQuality === wanted)) return;
@@ -4033,14 +4073,14 @@ const chrome = (() => {
   // rows show what BTR plays and downloads instead.
   function nativeInfoValues() {
     const info = player?.getDebug?.();
+    // In the compatibility mode the native core knows the codec, resolution and segments;
+    // only the download rows belong to BTR.
     if (player?.nativeTransport) {
       if (!player.transportActive) return null;
       const now = Date.now();
       while (recentBytes.length && now - recentBytes[0].at > 1000) recentBytes.shift();
-      // The native core knows the rendered codec, resolution and segment index.
-      // Override only transport data: its original URL cannot describe our CDN pieces.
       return {
-        "Player Type": "BTR Native",
+        "Player Type": "BTR Native (兼容模式)",
         "Video Host": lastHostByKind.video || undefined,
         "Audio Host": lastHostByKind.audio || undefined,
         "Video Speed": `${measuredSpeed("video", now)} Kbps`,
@@ -4097,7 +4137,6 @@ const chrome = (() => {
     }
     const identity = routeIdentity();
     if (!settings.enabled || !identity) {
-      nativeCoreWait = null;
       pendingPodSwitch = null;
       clearTakeoverFailure();
       stats.lastError = "";
@@ -4123,27 +4162,23 @@ const chrome = (() => {
     if (player && playerRoute === route && playerContainer?.isConnected && player.video?.isConnected) return;
     if (startingRoute === route) return;
     const container = findContainer();
-    if (!container) {
-      nativeCoreWait = null;
-      stats.playerState = stats.takeoverError?.route === route ? "error" : "waiting";
-      schedulePublish();
-      restartTimer = setTimeout(startPlayer, 350);
-      return;
-    }
-    const transport = root.__BILI_NATIVE_RANGE_PLAYER_FACTORY__;
-    const nativeVideo = container.querySelector("video");
-    // Allow asynchronous native initialization, but do not wait forever on an
-    // unsupported core. Each route/video gets its own bounded initialization wait.
-    if (transport && !transport.supports(container) && nativeVideo?.readyState === 0) {
-      if (nativeCoreWait?.route !== route || nativeCoreWait.video !== nativeVideo) {
-        nativeCoreWait = { route, video: nativeVideo, at: Date.now() };
-      }
+    // Bilibili's playback core appears a moment after its player. The compatibility mode
+    // needs it, so each video waits briefly for it instead of falling back at once.
+    const rangeTransport = settings.takeover === "compat" ? root.__BILI_NATIVE_RANGE_PLAYER_FACTORY__ : null;
+    if (container && rangeTransport && !rangeTransport.supports(container)) {
+      if (nativeCoreWait?.route !== route) nativeCoreWait = { route, at: Date.now() };
       if (Date.now() - nativeCoreWait.at < 3000) {
-        restartTimer = setTimeout(startPlayer, 350);
+        restartTimer = setTimeout(startPlayer, 250);
         return;
       }
     } else {
       nativeCoreWait = null;
+    }
+    if (!container) {
+      stats.playerState = stats.takeoverError?.route === route ? "error" : "waiting";
+      schedulePublish();
+      restartTimer = setTimeout(startPlayer, 350);
+      return;
     }
     const generation = routeGeneration;
     let playinfo = currentPlayinfo(identity);
@@ -4185,7 +4220,10 @@ const chrome = (() => {
     const resumeAfterStop = takeResumeHint();
     for (const meter of Object.values(speedMeters)) meter.shown = 0;
     try {
-      const factory = transport?.supports(container) ? transport : root.__BILI_NATIVE_MSE_PLAYER_FACTORY__;
+      // The compatibility mode needs Bilibili's own playback core; without it the video is
+      // taken over as usual.
+      const transport = settings.takeover === "compat" ? root.__BILI_NATIVE_RANGE_PLAYER_FACTORY__ : null;
+      const factory = transport?.supports(container) ? transport : playerFactory;
       const nextPlayer = factory.createNativePlayer({
         container,
         identity,
@@ -4267,7 +4305,7 @@ const chrome = (() => {
         return;
       }
       player = nextPlayer;
-      stats.architecture = player.nativeTransport ? "native-player-range-transport" : "bilibili-native-ui-progressive-mse-0.8-core";
+      stats.architecture = nextPlayer.nativeTransport ? "native-player-range-transport" : "bilibili-native-ui-progressive-mse-0.8-core";
       playerRoute = route;
       playerContainer = container;
       qualityPlayer = nextPlayer;
@@ -4308,11 +4346,11 @@ const chrome = (() => {
       settingsLoaded = true;
       notices?.configure(settings);
       const serversChanged = settings.mode === "custom" && previous.customHosts.join(",") !== settings.customHosts.join(",");
-      if (!hadLoadedSettings || previous.enabled !== settings.enabled || previous.mode !== settings.mode || previous.concurrency !== settings.concurrency || serversChanged) {
+      if (!hadLoadedSettings || previous.enabled !== settings.enabled || previous.takeover !== settings.takeover || previous.mode !== settings.mode || previous.concurrency !== settings.concurrency || serversChanged) {
         const cdn = settings.mode === "overseas" ? "海外 CDN"
           : settings.mode !== "custom" ? "大陆 CDN"
             : settings.customHosts.length ? `自定义的 ${settings.customHosts.length} 个服务器` : "大陆 CDN（自定义里还没选服务器）";
-        notices?.log("设置已经生效", `使用${cdn}，开启 ${settings.concurrency} 条下载线程。`, "success", "", undefined, "settings");
+        notices?.log("设置已经生效", `${settings.takeover === "compat" ? "兼容模式" : "全接管"}，使用${cdn}，开启 ${settings.concurrency} 条下载线程。`, "success", "", undefined, "settings");
       }
       stats.mode = settings.mode;
       syncSettingsMenu();
@@ -4321,7 +4359,7 @@ const chrome = (() => {
         stats.lastError = "";
         stopPlayer(true);
       }
-      else if (!previous.enabled) {
+      else if (!previous.enabled || previous.takeover !== settings.takeover) {
         restartPlayer(true);
       }
       else {
@@ -4409,7 +4447,7 @@ const chrome = (() => {
           state: stats.playerState, player: rest, nodes: stats.cdnHosts.map((item) => ({ ...item })), bannedNodes: cdnBans?.hosts?.() || [], timeline
         }, null, 1);
       },
-      version: "0.9.2.0"
+      version: "0.9.2.1"
     })
   });
   publish();
@@ -4726,7 +4764,7 @@ const chrome = (() => {
   "use strict";
 
   const CHANNEL = "__BILI_RANGE_ACCELERATOR_V1__";
-  const VERSION = "0.9.2.0";
+  const VERSION = "0.9.2.1";
   const notices = globalThis.__BTR_NOTIFICATION_VIEW__;
   const ERROR_NOTICE_ID = "__bilibili_thread_ripper_error_notice__";
   const ERROR_NOTICE_STYLE_ID = "__bilibili_thread_ripper_error_notice_style__";
@@ -4735,7 +4773,7 @@ const chrome = (() => {
   const ONBOARDING_STORAGE_KEY = "btrOnboardingRevision";
   const ONBOARDING_REVISION = "native-progressive-mse-v1";
   const THREAD_OPTIONS = Object.freeze([4, 8, 16, 32, 64, 128]);
-  const DEFAULTS = { enabled: true, concurrency: 8, mode: "mainland", customHosts: [], debugNotices: false, errorNotices: false, debugCategories: {} };
+  const DEFAULTS = { enabled: true, concurrency: 8, takeover: "full", mode: "mainland", customHosts: [], debugNotices: false, errorNotices: false, debugCategories: {} };
   // Settings of the old ArtPlayer version and of the removed compatibility modes.
   const RETIRED_KEYS = ["statusNotice", "compatibilityMode", "volume", "danmaku", "danmakuFontSize", "subtitleLanguage", "subtitleLastLanguage"];
   let latestSettings = { ...DEFAULTS };
@@ -4778,6 +4816,7 @@ const chrome = (() => {
       #${ONBOARDING_ID} .btr-onboarding-mode input:focus-visible+.btr-onboarding-mode-body{outline:2px solid #00aeec!important;outline-offset:2px!important}
       #${ONBOARDING_ID} .btr-onboarding-mode-name{display:block!important;margin:0 0 5px!important;font-size:14px!important;line-height:20px!important;font-weight:600!important}
       #${ONBOARDING_ID} .btr-onboarding-mode-note{display:block!important;color:#9499a0!important;font-size:12px!important;line-height:18px!important;font-weight:400!important}
+      #${ONBOARDING_ID} .btr-onboarding-hint{margin:8px 0 0!important;color:#9499a0!important;font-size:12px!important;line-height:18px!important}
       #${ONBOARDING_ID} .btr-onboarding-thread-head{display:flex!important;align-items:center!important;justify-content:space-between!important;margin:0 0 6px!important}
       #${ONBOARDING_ID} .btr-onboarding-thread-value{color:#fb7299!important;font-size:22px!important;line-height:28px!important;font-weight:700!important;font-variant-numeric:tabular-nums!important}
       #${ONBOARDING_ID} input[type="range"]{display:block!important;width:100%!important;height:24px!important;margin:0!important;accent-color:#fb7299!important;cursor:pointer!important}
@@ -4815,35 +4854,51 @@ const chrome = (() => {
     lead.className = "btr-onboarding-lead";
     lead.textContent = "首次使用请完成加速设置。播放器、弹幕和字幕仍由 B 站原生功能负责，线程撕裂者只优化视频传输。";
 
+    // Two cards to pick from, as for the CDN mode and the takeover mode.
+    const cardList = (inputName, options, selected) => {
+      const list = document.createElement("div");
+      list.className = "btr-onboarding-mode-list";
+      for (const option of options) {
+        const label = document.createElement("label");
+        label.className = "btr-onboarding-mode";
+        const input = document.createElement("input");
+        input.type = "radio";
+        input.name = inputName;
+        input.value = option.value;
+        input.checked = option.value === selected;
+        const body = document.createElement("span");
+        body.className = "btr-onboarding-mode-body";
+        const name = document.createElement("span");
+        name.className = "btr-onboarding-mode-name";
+        name.textContent = option.name;
+        const note = document.createElement("span");
+        note.className = "btr-onboarding-mode-note";
+        note.textContent = option.note;
+        body.append(name, note);
+        label.append(input, body);
+        list.append(label);
+      }
+      return list;
+    };
+
     const modeFieldset = document.createElement("fieldset");
     const modeLegend = document.createElement("legend");
     modeLegend.textContent = "CDN 模式";
-    const modeList = document.createElement("div");
-    modeList.className = "btr-onboarding-mode-list";
-    for (const option of [
+    modeFieldset.append(modeLegend, cardList("btr-onboarding-mode", [
       { value: "mainland", name: "大陆 CDN（推荐）", note: "优先使用大陆 bilivideo 节点" },
       { value: "overseas", name: "海外 CDN", note: "优先使用海外及镜像节点" }
-    ]) {
-      const label = document.createElement("label");
-      label.className = "btr-onboarding-mode";
-      const input = document.createElement("input");
-      input.type = "radio";
-      input.name = "btr-onboarding-mode";
-      input.value = option.value;
-      input.checked = option.value === latestSettings.mode;
-      const body = document.createElement("span");
-      body.className = "btr-onboarding-mode-body";
-      const name = document.createElement("span");
-      name.className = "btr-onboarding-mode-name";
-      name.textContent = option.name;
-      const note = document.createElement("span");
-      note.className = "btr-onboarding-mode-note";
-      note.textContent = option.note;
-      body.append(name, note);
-      label.append(input, body);
-      modeList.append(label);
-    }
-    modeFieldset.append(modeLegend, modeList);
+    ], latestSettings.mode));
+
+    const takeoverFieldset = document.createElement("fieldset");
+    const takeoverLegend = document.createElement("legend");
+    takeoverLegend.textContent = "接管方式";
+    const takeoverHint = document.createElement("p");
+    takeoverHint.className = "btr-onboarding-hint";
+    takeoverHint.textContent = "Safari 用户建议使用兼容模式。以后可以在设置面板里随时改。";
+    takeoverFieldset.append(takeoverLegend, cardList("btr-onboarding-takeover", [
+      { value: "full", name: "全接管（推荐）", note: "视频由插件自己来放，什么时候下、下多少都由插件安排，效果最好" },
+      { value: "compat", name: "兼容模式", note: "还是 B 站自己的播放器在放，插件只帮它多线程下载，换清晰度交给 B 站，更不容易出问题" }
+    ], latestSettings.takeover), takeoverHint);
 
     const threadFieldset = document.createElement("fieldset");
     const threadHead = document.createElement("div");
@@ -4889,11 +4944,12 @@ const chrome = (() => {
     status.setAttribute("aria-live", "polite");
     save.addEventListener("click", () => {
       const mode = panel.querySelector('input[name="btr-onboarding-mode"]:checked')?.value === "overseas" ? "overseas" : "mainland";
+      const takeover = panel.querySelector('input[name="btr-onboarding-takeover"]:checked')?.value === "compat" ? "compat" : "full";
       const concurrency = THREAD_OPTIONS[Number(threadRange.value)] || 8;
       save.disabled = true;
       save.textContent = "正在保存…";
-      latestSettings = normalizeStoredSettings({ ...latestSettings, enabled: true, mode, concurrency });
-      chrome.storage.sync.set({ enabled: true, mode, concurrency }, () => {
+      latestSettings = normalizeStoredSettings({ ...latestSettings, enabled: true, mode, takeover, concurrency });
+      chrome.storage.sync.set({ enabled: true, mode, takeover, concurrency }, () => {
         if (chrome.runtime.lastError) {
           status.textContent = `保存失败：${chrome.runtime.lastError.message}`;
           save.disabled = false;
@@ -4916,7 +4972,7 @@ const chrome = (() => {
       });
     });
 
-    panel.append(heading, lead, modeFieldset, threadFieldset, tip, save, status);
+    panel.append(heading, lead, modeFieldset, takeoverFieldset, threadFieldset, tip, save, status);
     overlay.append(panel);
     mount.append(overlay);
     save.focus({ preventScroll: true });
@@ -4938,6 +4994,7 @@ const chrome = (() => {
     return {
       enabled: input?.enabled !== false,
       concurrency: THREAD_OPTIONS.includes(threads) ? threads : 8,
+      takeover: input?.takeover === "compat" ? "compat" : "full",
       mode: ["overseas", "custom"].includes(input?.mode) ? input.mode : "mainland",
       customHosts: (Array.isArray(input?.customHosts) ? input.customHosts : [])
         .map((host) => String(host).trim().toLowerCase())

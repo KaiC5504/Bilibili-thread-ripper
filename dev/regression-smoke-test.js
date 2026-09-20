@@ -16,7 +16,8 @@ const { chromium } = require("playwright");
     ["fast-takeover-test.html", "fast-takeover-result"],
     ["buffer-window-test.html", "buffer-window-result"],
     ["autoplay-choice-test.html", "autoplay-choice-result"],
-    ["codec-choice-test.html", "codec-choice-result"]
+    ["codec-choice-test.html", "codec-choice-result"],
+    ["takeover-mode-test.html", "takeover-mode-result"]
   ];
   try {
     for (let offset = 0; offset < tests.length; offset += 3) {

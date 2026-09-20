@@ -7,13 +7,12 @@
   const downloaders = root.__BILI_IDM_DOWNLOADER_FACTORY__;
   if (!core || !resolvers || !downloaders || !root.fetch || !root.XMLHttpRequest) return;
   const nativeFetch = root.fetch.bind(root);
-  // Other browsers keep the existing MSE engine. Safari needs the native
-  // decoder/buffer lifecycle to switch renditions without replacing MediaSource.
-  const safari = /Macintosh/.test(root.navigator?.userAgent || "")
-    && /Version\/.*Safari\//.test(root.navigator?.userAgent || "")
-    && !/(Chrome|Chromium|Edg|OPR|FxiOS|CriOS)\//.test(root.navigator?.userAgent || "");
-  if (!safari) return;
+  // The compatibility mode ("兼容模式" in the settings): Bilibili's own player keeps the
+  // decoder, the buffer and the quality switching, and only its media requests are
+  // downloaded here. Safari needs it, because replacing the MediaSource breaks its quality
+  // switching. Nothing is intercepted until a player of this mode is created.
   let active = null;
+  let passthroughFetch = nativeFetch;
 
   function nativeCore(video) {
     const wrapper = root.player?.__core?.(), dash = wrapper?.getCorePlayer?.();
@@ -253,29 +252,29 @@
     return response;
   }
 
-  root.fetch = function (input, init) {
+  function interceptedFetch(input, init) {
     const url = input instanceof Request ? input.url : String(input);
     const method = String(init?.method || (input instanceof Request ? input.method : "GET")).toUpperCase();
-    if (!active || method !== "GET" || !core.isBilibiliMediaUrl(url)) return nativeFetch(input, init);
+    if (!active || method !== "GET" || !core.isBilibiliMediaUrl(url)) return passthroughFetch(input, init);
     let request;
     try { request = new Request(input instanceof Request ? input : new URL(String(input), root.location.href), init); }
-    catch (_error) { return nativeFetch(input, init); }
+    catch (_error) { return passthroughFetch(input, init); }
     const plan = request.mode === "no-cors" || request.integrity ? null
       : planRequest(request.url, request.method, request.headers, request.credentials);
-    if (!plan) return nativeFetch(input, init);
+    if (!plan) return passthroughFetch(input, init);
     return download(plan, request.signal).then(({ bytes, headers }) => {
       if (request.signal.aborted) throw request.signal.reason;
       return responseURL(new Response(bytes, { status: 206, statusText: "Partial Content", headers }), request.url);
     });
-  };
+  }
 
   // Preserve the actual XMLHttpRequest object, event handlers and prototype. Only
   // eligible arraybuffer requests receive a synthetic response. Calling open()
   // again restores all native response accessors before the object is reused.
   const proto = root.XMLHttpRequest.prototype;
-  const nativeOpen = proto.open, nativeSend = proto.send, nativeAbort = proto.abort;
-  const nativeSetHeader = proto.setRequestHeader;
-  const nativeGetHeader = proto.getResponseHeader, nativeGetHeaders = proto.getAllResponseHeaders;
+  // Taken when the interception is installed, so anything already wrapping fetch or
+  // XMLHttpRequest (the playurl reader of page-hook.js) stays in the chain.
+  let nativeOpen, nativeSend, nativeAbort, nativeSetHeader, nativeGetHeader, nativeGetHeaders;
   const requests = new WeakMap();
   const fields = ["readyState", "status", "statusText", "response", "responseText", "responseURL"];
   function emit(xhr, type, progress) {
@@ -302,7 +301,7 @@
     emit(xhr, type, progress);
     if (requests.get(xhr) === entry) emit(xhr, "loadend", progress);
   }
-  proto.open = function (method, url, async = true, ...rest) {
+  const patchedOpen = function (method, url, async = true, ...rest) {
     const previous = requests.get(this);
     requests.delete(this);
     if (previous) {
@@ -316,22 +315,22 @@
       async: async !== false, headers: new Headers(), authenticated: rest.some(value => value != null), sending: false, synthetic: false });
     return result;
   };
-  proto.setRequestHeader = function (name, value) {
+  const patchedSetRequestHeader = function (name, value) {
     const entry = requests.get(this);
     if (entry?.synthetic) throw new DOMException("Call open() before sending again", "InvalidStateError");
     const result = nativeSetHeader.call(this, name, value);
     entry?.headers.append(name, value);
     return result;
   };
-  proto.getResponseHeader = function (name) {
+  const patchedGetResponseHeader = function (name) {
     const entry = requests.get(this);
     return entry?.synthetic ? (entry.state >= 2 ? entry.responseHeaders.get(name) : null) : nativeGetHeader.call(this, name);
   };
-  proto.getAllResponseHeaders = function () {
+  const patchedGetAllResponseHeaders = function () {
     const entry = requests.get(this);
     return entry?.synthetic ? (entry.state >= 2 ? [...entry.responseHeaders].map(([key, value]) => `${key}: ${value}\r\n`).join("") : "") : nativeGetHeaders.call(this);
   };
-  proto.abort = function () {
+  const patchedAbort = function () {
     const entry = requests.get(this);
     if (!entry?.synthetic) return nativeAbort.call(this);
     entry.status = 0; entry.statusText = ""; entry.responseUrl = ""; entry.body = null; entry.responseHeaders = new Headers();
@@ -341,7 +340,7 @@
     }
     if (requests.get(this) === entry && !entry.sending) entry.state = 0;
   };
-  proto.send = function (body) {
+  const patchedSend = function (body) {
     const entry = requests.get(this);
     if (entry?.synthetic) throw new DOMException("Call open() before sending again", "InvalidStateError");
     if (this.readyState !== 1) return nativeSend.call(this, body);
@@ -393,9 +392,32 @@
     });
   };
 
+  // Only a player of this mode installs the interception, and what is in place then keeps
+  // working under it. The other mode never sees any of this.
+  let intercepting = false;
+  function installInterception() {
+    if (intercepting) return;
+    intercepting = true;
+    passthroughFetch = root.fetch.bind(root);
+    nativeOpen = proto.open;
+    nativeSend = proto.send;
+    nativeAbort = proto.abort;
+    nativeSetHeader = proto.setRequestHeader;
+    nativeGetHeader = proto.getResponseHeader;
+    nativeGetHeaders = proto.getAllResponseHeaders;
+    root.fetch = interceptedFetch;
+    proto.open = patchedOpen;
+    proto.setRequestHeader = patchedSetRequestHeader;
+    proto.getResponseHeader = patchedGetResponseHeader;
+    proto.getAllResponseHeaders = patchedGetAllResponseHeaders;
+    proto.abort = patchedAbort;
+    proto.send = patchedSend;
+  }
+
   function createNativePlayer(options) {
     const video = options.container.querySelector("video");
     if (!video) throw new Error("没有找到 B 站原生 video 元素");
+    installInterception();
     if (active) active.destroy();
     let tracks = [], lastVideo = null, lastAudio = null;
     let delivered = 0, failures = 0, nativeSwitchRequests = 0;

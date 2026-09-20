@@ -51,6 +51,12 @@
         <p class="custom-note">只能填 B 站的视频服务器（bilivideo.com、akamaized.net 等），视频的下载地址不会发给别的网站。</p>
       </section>
 
+      <section class="takeover-select" aria-label="接管方式">
+        <label><input type="radio" name="takeover" value="full"><span>全接管</span></label>
+        <label><input type="radio" name="takeover" value="compat"><span>兼容模式</span></label>
+      </section>
+      <p class="takeover-note">Safari 用户建议使用兼容模式。<br>全接管：视频由插件自己来放，什么时候下、下多少都由插件安排，效果最好。<br>兼容模式：还是 B 站自己的播放器在放，插件只帮它多线程下载，换清晰度这些都交给 B 站，更不容易出问题。</p>
+
       <section class="controls">
         <div class="control-title">
           <label for="concurrency">线程加载数</label>
@@ -109,6 +115,13 @@
     .mode-select span { display: block; padding: 10px 6px; color: #949baa; background: #20232a; font-size: 12px; text-align: center; cursor: pointer; }
     .mode-select input:checked + span { color: #fff; background: #fb7299; }
     .mode-select input:focus-visible + span { outline: 2px solid #fff; outline-offset: -3px; }
+    .takeover-select { display: grid; grid-template-columns: repeat(2, 1fr); gap: 1px; margin-bottom: 8px; overflow: hidden; border: 1px solid #30343d; border-radius: 8px; background: #30343d; }
+    .takeover-select label { position: relative; }
+    .takeover-select input { position: absolute; opacity: 0; }
+    .takeover-select span { display: block; padding: 10px 6px; color: #949baa; background: #20232a; font-size: 12px; text-align: center; cursor: pointer; }
+    .takeover-select input:checked + span { color: #fff; background: #fb7299; }
+    .takeover-select input:focus-visible + span { outline: 2px solid #fff; outline-offset: -3px; }
+    .takeover-note { margin: 0 0 12px; padding: 0 2px; color: #7f8797; font-size: 11px; line-height: 1.6; }
     .custom-hosts { margin-bottom: 12px; padding: 14px 16px; border: 1px solid #30343d; border-radius: 8px; background: #20232a; }
     .custom-hosts[hidden] { display: none; }
     .custom-head { display: flex; align-items: center; justify-content: space-between; color: #c9ced9; font-size: 13px; }
@@ -277,6 +290,7 @@
 
     function render(settings) {
       enabled.checked = settings.enabled;
+      for (const radio of shadow.querySelectorAll('input[name="takeover"]')) radio.checked = radio.value === settings.takeover;
       setSlider(settings.concurrency);
       setMode(settings.mode);
       customHosts = settings.customHosts;
@@ -300,6 +314,9 @@
         setMode(radio.value);
         save({ mode: radio.value });
       });
+    }
+    for (const radio of shadow.querySelectorAll('input[name="takeover"]')) {
+      radio.addEventListener("change", () => { if (radio.checked) save({ takeover: radio.value }); });
     }
     $("known-hosts").addEventListener("change", (event) => {
       const input = event.target;
