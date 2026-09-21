@@ -788,6 +788,8 @@
     playerRoute = "";
     playerContainer = null;
     current?.destroy({ resumeNative });
+    // The suppressed native schedulers must run again once Bilibili owns playback.
+    if (resumeNative && current && !current.nativeTransport) resumeNativeSchedulers();
     if (settings.enabled) stats.playerState = "waiting";
     else stats.playerState = "disabled";
     publish();
@@ -902,6 +904,7 @@
     if (fastResolveTimer) return;
     fastResolveTimer = setInterval(() => {
       resolveNativeQualitySwitch();
+      suppressNativeSchedulers();
       let pending = null;
       try { pending = root.player?.__core?.()?.qnSwitchingInfo?.video; } catch (_error) {}
       if (Date.now() > fastResolveUntil || !pending?.switching || resolvedSwitchToken === pending) {
@@ -909,6 +912,39 @@
         fastResolveTimer = null;
       }
     }, 150);
+  }
+
+  // While BTR plays the video, Bilibili's dash core keeps its schedule controllers running:
+  // seeking and quality switches wake them, they download the same segments in parallel with
+  // ours (an 8K stream doubles the bandwidth bill), and their appends then crash forever on
+  // the long-detached SourceBuffers — the endless "reading 'updating' of null" TypeErrors.
+  // While the takeover is active the controllers are stopped, and stopped again on every
+  // native wake-up; handing the video back to Bilibili starts them again.
+  function nativeStreamProcessors() {
+    try { return root.player?.__core?.()?.getCorePlayer?.()?.getActiveStream?.()?.getProcessors?.() || []; }
+    catch (_error) { return []; }
+  }
+
+  function suppressNativeSchedulers() {
+    if (!player || player.nativeTransport || playerContainer?.dataset.btrMseActive !== "true") return;
+    for (const processor of nativeStreamProcessors()) {
+      try {
+        const scheduler = processor?.getScheduleController?.();
+        if (scheduler?.isStarted?.() && typeof scheduler.stop === "function") {
+          scheduler.stop();
+          remember("native scheduler stopped", String(processor.getType?.() || ""));
+        }
+      } catch (_error) {}
+    }
+  }
+
+  function resumeNativeSchedulers() {
+    for (const processor of nativeStreamProcessors()) {
+      try {
+        const scheduler = processor?.getScheduleController?.();
+        if (scheduler && scheduler.isStarted?.() === false && typeof scheduler.start === "function") scheduler.start();
+      } catch (_error) {}
+    }
   }
 
   // The codec picked in the player's 播放策略 menu. Bilibili stores it as
@@ -1224,6 +1260,7 @@
       stats.architecture = nextPlayer.nativeTransport ? "native-player-range-transport" : "bilibili-native-ui-progressive-mse-0.8-core";
       playerRoute = route;
       playerContainer = container;
+      suppressNativeSchedulers();
       qualityPlayer = nextPlayer;
       syncedQuality = preferredQuality;
       codecPlayer = nextPlayer;
@@ -1338,6 +1375,7 @@
       syncNativeQuality();
       syncNativeCodec();
       resolveNativeQualitySwitch();
+      suppressNativeSchedulers();
       refreshExpiringPlayinfo();
     }
     updateNativeInfoPanel();
