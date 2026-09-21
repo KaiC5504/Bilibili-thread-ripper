@@ -161,8 +161,8 @@
     await sleep(1700);
     const removalsAfterLargeStep = { ...removals };
 
-    // A seek outside the buffer starts a new session. The initialization segment and the
-    // index of the same file are not asked for a second time.
+    // A seek outside the buffer moves the tracks inside the running session: no new session,
+    // and the initialization segment and the index of the same file are not asked for again.
     const headersBeforeSeek = headerDownloads;
     const firstAfterSeek = Math.floor(150 / SEGMENT_SECONDS);
     delete started[firstAfterSeek];
@@ -174,7 +174,7 @@
     player.destroy({ resumeNative: false });
 
     const output = { errors, filledAhead, lateStarts, removalsAfterJump, removalsAfterSmallStep, removalsAfterLargeStep, seek };
-    output.seekKeptHeaders = seek.headersBeforeSeek === 4 && seek.headersAfterSeek === 4 && seek.sessions === 2 && seek.lastSeekMs > 0 && seek.startedAtTarget;
+    output.seekKeptHeaders = seek.headersBeforeSeek === 4 && seek.headersAfterSeek === 4 && seek.sessions === 1 && seek.lastSeekMs > 0 && seek.startedAtTarget;
     output.filled = filledAhead >= 44;
     output.keptWindowFull = lateStarts.length === 0;
     output.prunedOncePerStep = removalsAfterJump.video === 1 && removalsAfterJump.audio === 1

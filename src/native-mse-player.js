@@ -229,6 +229,30 @@
     });
   }
 
+  // Bilibili's core keeps its own element listeners while BTR plays, and they run against
+  // state it never finished initializing: its seek handler reads DVRWindow off a
+  // representation info it only fills once its own stream starts, and its buffer checks read
+  // 'updating' off a SourceBuffer that left its MediaSource. Both throw into the page on every
+  // drag, where its own error reporter picks them up. While a takeover is active these two are
+  // swallowed and counted for the diagnostic report; every other error, and every error while
+  // Bilibili itself plays, is left untouched.
+  const nativeLeftovers = { suppressed: 0, last: "" };
+  const NATIVE_LEFTOVER_RE = /DVRWindow|reading '?updating'?/;
+  let leftoverGuardInstalled = false;
+  function installNativeErrorGuard() {
+    if (leftoverGuardInstalled || typeof root.addEventListener !== "function") return;
+    leftoverGuardInstalled = true;
+    root.addEventListener("error", (event) => {
+      if (!NATIVE_LEFTOVER_RE.test(String(event.message || ""))) return;
+      if (!/hdslb\.com\/.*player/i.test(String(event.filename || ""))) return;
+      if (!document.querySelector('[data-btr-mse-active="true"]')) return;
+      nativeLeftovers.suppressed += 1;
+      nativeLeftovers.last = String(event.message || "").slice(0, 120);
+      event.preventDefault();
+      event.stopImmediatePropagation();
+    }, true);
+  }
+
   function createNativePlayer(options) {
     const getSettings = options.getSettings;
     const video = options.container.querySelector("video");
@@ -395,7 +419,8 @@
         nextIndex: startupIndex,
         startupIndex,
         complete: false,
-        filling: false,
+        // The generation whose fill loop holds this track, 0 when no loop runs.
+        filling: 0,
         started: false,
         startupComplete: false,
         startupScheduled: false,
@@ -407,9 +432,30 @@
       return track;
     }
 
+    // Each generation of a session downloads under its own signal, chained to the session's:
+    // a seek inside the session cancels the segments of the position left behind without
+    // ending the session itself.
+    function openGeneration(candidate) {
+      candidate.generation = ++generationSequence;
+      candidate.generationController = new AbortController();
+      const reason = () => candidate.controller.signal.reason || new DOMException("播放任务已取消", "AbortError");
+      if (candidate.controller.signal.aborted) candidate.generationController.abort(reason());
+      else if (!candidate.generationLinked) {
+        // One listener for the session, cancelling whichever generation is current: a session
+        // with many seeks must not pile up listeners on its own signal.
+        candidate.generationLinked = true;
+        candidate.controller.signal.addEventListener("abort", () => candidate.generationController?.abort(reason()), { once: true });
+      }
+      return candidate.generationController;
+    }
+
+    function generationSignal(candidate) {
+      return (candidate.generationController || candidate.controller).signal;
+    }
+
     function segmentDownload(candidate, track, segment, index, downloadOptions = {}) {
       return downloader.downloadRange(segment, track.resolver, {
-        signal: candidate.controller.signal,
+        signal: generationSignal(candidate),
         parallel: true,
         kind: track.kind,
         priority: downloadOptions.priority,
@@ -467,10 +513,12 @@
     }
 
     async function fillTrack(candidate, track) {
-      if (track.filling || track.complete || !sessionIsCurrent(candidate) || candidate.fatal) return;
-      track.filling = true;
+      // The lock carries its generation: a loop cancelled by a seek must not unlock the loop
+      // that replaced it, which would leave two loops downloading the same segments.
+      if (track.filling === candidate.generation || track.complete || !sessionIsCurrent(candidate) || candidate.fatal) return;
       const generation = candidate.generation;
-      const signal = candidate.controller.signal;
+      track.filling = generation;
+      const signal = generationSignal(candidate);
       try {
         while (sessionIsCurrent(candidate) && generation === candidate.generation && !signal.aborted) {
           const current = Number(video.currentTime) || candidate.startTime;
@@ -547,7 +595,7 @@
       } catch (error) {
         if (!signal.aborted && sessionIsCurrent(candidate)) fatal(candidate, error);
       } finally {
-        track.filling = false;
+        if (track.filling === generation) track.filling = 0;
         maybeEndStream(candidate);
       }
     }
@@ -655,6 +703,18 @@
         const remaining = Math.max(0.5, (Number(candidate.mediaSource.duration) || current + candidate.recoveryTargetSeconds) - current);
         if (ahead >= Math.min(reachableSeconds(candidate, candidate.recoveryTargetSeconds), remaining)) {
           candidate.recovering = false;
+          // A seek inside the session waits here instead of in activateWhenReady, so this is
+          // where the panel's "how long did the jump take" is measured.
+          if (candidate.seekPending) {
+            candidate.seekPending = false;
+            if (seekStartedAt) {
+              lastSeekMs = performance.now() - seekStartedAt;
+              seekStartedAt = 0;
+              seekSettledAt = performance.now();
+              stallsAfterSeek = 0;
+              options.onLog?.("跳转后的数据准备好了", `从点击进度条到可以继续播放用了 ${Math.round(lastSeekMs)} 毫秒。`, "success", "buffer");
+            }
+          }
           options.onLog?.("缓冲补好了，可以继续播放", `已经备好接下来 ${ahead.toFixed(1)} 秒的数据。`, "success", "buffer");
           candidate.playAttempted = false;
           attemptAutoplay(candidate);
@@ -711,7 +771,8 @@
       const mediaSource = new MediaSource();
       const objectUrl = URL.createObjectURL(mediaSource);
       const candidate = {
-        disposed: false, fatal: false, externalSourceDetected: false, generation: ++generationSequence,
+        disposed: false, fatal: false, externalSourceDetected: false, generation: 0,
+        generationController: null, generationLinked: false, seekPending: false,
         controller: new AbortController(), mediaSource, objectUrl,
         timer: null, endRetryTimer: null, tracks: [], ending: false, streamEnded: false,
         playAttempted: false, playbackActivated: false, playbackActivatedAt: 0,
@@ -728,6 +789,7 @@
         videoResolver: resolverFactory.createResolver(representation, () => core.normalizeSettings(getSettings()).mode, options.cdnBans, () => core.normalizeSettings(getSettings()).customHosts),
         audioResolver: resolverFactory.createResolver(audio, () => core.normalizeSettings(getSettings()).mode, options.cdnBans, () => core.normalizeSettings(getSettings()).customHosts)
       };
+      openGeneration(candidate);
       session = candidate;
       if (previous) disposeSession(previous, false);
       video.pause();
@@ -775,6 +837,49 @@
       }
     }
 
+    // Seeking inside the running session: the tracks move to the target's segment and the
+    // element keeps its MediaSource. Rebuilding the session for every seek reset the element
+    // to zero first (video.src + load()) and only then restored the position, so anything
+    // else watching the same element — Bilibili's own core, another user script — could catch
+    // it at zero and put its own position back. Nothing writes currentTime here at all.
+    async function seekWithinSession(candidate, target) {
+      const previousGeneration = candidate.generationController;
+      openGeneration(candidate);
+      // The segments of the position left behind are no longer wanted.
+      previousGeneration?.abort(new DOMException("已经跳到新的位置", "AbortError"));
+      candidate.startTime = target;
+      candidate.streamEnded = false;
+      candidate.ending = false;
+      clearTimeout(candidate.endRetryTimer);
+      candidate.quotaWaits = 0;
+      for (const track of candidate.tracks) {
+        track.prefetches.clear();
+        track.held = null;
+        track.complete = false;
+        track.started = false;
+        track.nextIndex = track.startupIndex = sidxTools.segmentIndexAt(track.sidx.segments, target);
+      }
+      // Media buffered far from the target only takes room the new position needs.
+      const duration = Number(candidate.mediaSource.duration);
+      if (Number.isFinite(duration)) {
+        for (const track of candidate.tracks) {
+          removeRange(candidate, track, 0, Math.max(0, target - 5)).catch(() => {});
+          removeRange(candidate, track, target + aheadTarget(candidate) + 30, duration).catch(() => {});
+        }
+      }
+      candidate.resumeWanted = wantsToPlay();
+      // Once playing, the wait for the new position is the same wait as a rebuffer.
+      if (candidate.playbackActivated) {
+        candidate.recovering = true;
+        candidate.recoveryTargetSeconds = Math.max(STARTUP_RECOVERY_SECONDS, candidate.startupTargetSeconds);
+        candidate.playAttempted = false;
+        candidate.seekPending = true;
+        video.pause();
+      }
+      ensureBuffer(candidate);
+      publishState();
+    }
+
     async function seek() {
       const candidate = session;
       if (!candidate || !sessionIsCurrent(candidate) || !candidate.tracks.length) return;
@@ -794,8 +899,13 @@
       options.onLog?.("你跳到的位置还需要加载", `正在为 ${target.toFixed(2)} 秒的位置重新准备数据。`, "info", "buffer");
       // A video sent back to its start right after it ended is the player's 单集循环 or its
       // replay button, which mean to play it again. The video is paused at that moment, so
-      // without this the next round would stop at the first frame (issue #17).
+      // without this the next round would stop at the first frame (issue #17); that case keeps
+      // the full restart, which owns the intent to play again.
       const restarting = target < 1 && (video.ended || performance.now() - endedAt < 2000);
+      if (!restarting && candidate.mediaSource.readyState !== "closed") {
+        await seekWithinSession(candidate, target);
+        return;
+      }
       await startSession(selectedVideo, {
         time: target,
         resume: wantsToPlay() || restarting,
@@ -1030,6 +1140,9 @@
         startupWaitingEvents: session?.startupWaitingEvents || 0,
         bufferAheadLimit: session?.bufferAheadLimit || 0,
         urlDeadline: urlDeadlineSeconds(),
+        // Errors from Bilibili's idle core that were kept out of the page's console.
+        nativeLeftoversSuppressed: nativeLeftovers.suppressed,
+        lastNativeLeftover: nativeLeftovers.last,
         progressiveAppends: session?.progressiveAppends || 0,
         seekReloads,
         lastSeekMs: Math.round(lastSeekMs),
@@ -1041,5 +1154,6 @@
   }
 
   installBufferedShim();
+  installNativeErrorGuard();
   root.__BILI_NATIVE_MSE_PLAYER_FACTORY__ = Object.freeze({ createNativePlayer, qualityLabel, selectRepresentations });
 })(globalThis);

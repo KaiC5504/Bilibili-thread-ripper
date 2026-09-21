@@ -321,15 +321,16 @@
     await sleep(100);
     const deadlines = [...new Set(downloadedUrls.slice(from).map((item) => Number(new URL(item.url).searchParams.get("deadline"))))];
     const reported = player.urlDeadlineSeconds();
-    // A drag far outside the buffer starts a new session. It must not pick the older
-    // addresses up again from the playinfo that was turned away.
+    // A drag far outside the buffer moves both tracks to the new position inside the running
+    // session. It must not pick the older addresses up again from the playinfo that was
+    // turned away, and it must not rebuild the session (which would reset the element).
     const sessions = player.getDebug().sessionStarts;
     const afterSeek = downloadedUrls.length;
     bufferSetup = { video: { ranges: [] }, audio: { ranges: [] } };
     clock = 100;
     video.dispatchEvent(new Event("seeking"));
-    const restarted = await until(() => player.getDebug().sessionStarts > sessions
-      && ["video", "audio"].every((kind) => downloadedUrls.slice(afterSeek).some((item) => item.kind === kind)), 6000);
+    const restarted = await until(() => ["video", "audio"].every((kind) => downloadedUrls.slice(afterSeek).some((item) => item.kind === kind)), 6000)
+      && player.getDebug().sessionStarts === sessions;
     await sleep(200);
     const afterSeekDeadlines = [...new Set(downloadedUrls.slice(afterSeek).map((item) => Number(new URL(item.url).searchParams.get("deadline"))))];
     player.destroy({ resumeNative: false });
