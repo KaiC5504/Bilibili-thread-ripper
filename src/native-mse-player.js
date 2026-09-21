@@ -286,7 +286,27 @@
     function append(candidate, track, bytes, generation) {
       return queuedSourceOperation(candidate, track, async () => {
         if (!sessionIsCurrent(candidate) || generation !== candidate.generation) return;
-        track.sourceBuffer.appendBuffer(bytes);
+        try {
+          track.sourceBuffer.appendBuffer(bytes);
+        } catch (error) {
+          // The browser caps how much a SourceBuffer holds (about 150 MB of video in
+          // Chromium), which a 4K video reaches within the 45 second window. Freeing
+          // played data and asking for less ahead keeps the video playing; failing the
+          // append here would hand the whole video back to Bilibili.
+          if (error?.name !== "QuotaExceededError") throw error;
+          const current = Number(video.currentTime) || 0;
+          const ahead = Math.max(0, bufferedEndAt(track.sourceBuffer, current) - current);
+          candidate.bufferAheadLimit = Math.max(15, Math.min(candidate.bufferAheadLimit || Infinity, ahead * 0.75));
+          note("buffer quota hit", `${track.kind} keeps ${candidate.bufferAheadLimit.toFixed(0)}s ahead`);
+          options.onLog?.("浏览器缓冲区满了", `已释放播放过的数据，这个视频接下来最多提前缓冲 ${candidate.bufferAheadLimit.toFixed(0)} 秒。`, "info", "buffer");
+          const behindEnd = Math.max(0, current - 5);
+          if (behindEnd > 0 && bufferedStart(track.sourceBuffer, behindEnd) < behindEnd) {
+            track.sourceBuffer.remove(0, behindEnd);
+            await waitEvent(track.sourceBuffer, "updateend", "error", candidate.controller.signal);
+          }
+          if (!sessionIsCurrent(candidate) || generation !== candidate.generation) return;
+          track.sourceBuffer.appendBuffer(bytes);
+        }
         await waitEvent(track.sourceBuffer, "updateend", "error", candidate.controller.signal);
       });
     }
@@ -383,6 +403,12 @@
       ensureBuffer(candidate);
     }
 
+    // How far ahead this session may buffer: the setting, brought down when the
+    // browser's own buffer quota was hit.
+    function aheadTarget(candidate) {
+      return Math.min(core.normalizeSettings(getSettings()).bufferAheadSeconds, candidate.bufferAheadLimit || Infinity);
+    }
+
     async function fillTrack(candidate, track) {
       if (track.filling || track.complete || !sessionIsCurrent(candidate) || candidate.fatal) return;
       track.filling = true;
@@ -395,7 +421,7 @@
             track.complete = true;
             break;
           }
-          if (bufferedEndAt(track.sourceBuffer, current) - current >= core.normalizeSettings(getSettings()).bufferAheadSeconds) break;
+          if (bufferedEndAt(track.sourceBuffer, current) - current >= aheadTarget(candidate)) break;
           // A sliding window: the next segment starts as soon as one has been appended. Waiting
           // for a whole batch left the connections idle until its slowest segment arrived.
           const windowSize = track.started ? (track.kind === "video" ? 3 : 4) : 1;
@@ -403,7 +429,7 @@
           for (let offset = 0; offset < windowSize; offset += 1) {
             const index = track.nextIndex + offset;
             const segment = track.sidx.segments[index];
-            if (!segment || projectedEnd - current >= core.normalizeSettings(getSettings()).bufferAheadSeconds) break;
+            if (!segment || projectedEnd - current >= aheadTarget(candidate)) break;
             projectedEnd = segment.endTime;
             if (track.prefetches.has(index)) continue;
             const startup = !track.startupComplete && index === track.startupIndex;
@@ -611,7 +637,7 @@
         controller: new AbortController(), mediaSource, objectUrl,
         timer: null, endRetryTimer: null, tracks: [], ending: false, streamEnded: false,
         playAttempted: false, playbackActivated: false, playbackActivatedAt: 0,
-        recovering: false, recoveryTargetSeconds: STARTUP_RECOVERY_SECONDS,
+        recovering: false, recoveryTargetSeconds: STARTUP_RECOVERY_SECONDS, bufferAheadLimit: 0,
         startupCompletedBytes: 0, startupPrefetchLaunched: false, startupStartedAt: performance.now(),
         progressiveAppends: 0,
         startupTargetSeconds: 6, startupThroughputBps: 0, mediaBytesPerSecond: 0,
@@ -755,14 +781,42 @@
       };
     }
 
+    // A refreshed playinfo names the same files with fresh signatures. The resolvers of a
+    // running session keep reading their representation objects, so those objects receive
+    // the new addresses; nothing else about the session changes.
+    function refreshRepresentationUrls(target, source) {
+      if (!target || !source || target === source) return;
+      for (const key of ["baseUrl", "base_url", "backupUrl", "backup_url", "backup_url_list"]) {
+        if (source[key] !== undefined) target[key] = source[key];
+      }
+    }
+
+    // When the earliest signed address of the playing tracks expires, in seconds since the
+    // epoch. 0 when no address carries a deadline.
+    function urlDeadlineSeconds() {
+      let earliest = 0;
+      for (const representation of [selectedVideo, selection.audio]) {
+        try {
+          const deadline = Number(new URL(representationUrl(representation)).searchParams.get("deadline")) || 0;
+          if (deadline > 0 && (!earliest || deadline < earliest)) earliest = deadline;
+        } catch (_error) {}
+      }
+      return earliest;
+    }
+
     async function updatePlayinfo(playinfo) {
       if (destroyed) return;
       const next = selectRepresentations(playinfo, preferredQuality, preferredCodec);
       currentPlayinfo = playinfo;
       const nextVideo = next.preferred;
-      const audioChanged = !sameRepresentation(selection.audio, next.audio);
+      const previousAudio = selection.audio;
+      const audioChanged = !sameRepresentation(previousAudio, next.audio);
       selection = next;
-      if (!audioChanged && sameRepresentation(selectedVideo, nextVideo)) return;
+      if (!audioChanged && sameRepresentation(selectedVideo, nextVideo)) {
+        refreshRepresentationUrls(selectedVideo, nextVideo);
+        refreshRepresentationUrls(previousAudio, next.audio);
+        return;
+      }
       await startSession(nextVideo, playbackState());
     }
 
@@ -847,9 +901,10 @@
       setCodec,
       setQuality,
       updatePlayinfo,
+      urlDeadlineSeconds,
       video,
       getDebug: () => ({
-        version: "0.9.2.3",
+        version: "0.9.3.0",
         architecture: "bilibili-native-ui-progressive-mse-0.8-core",
         quality: qualityLabel(selectedVideo),
         qualityId: Number(selectedVideo?.id) || 0,
@@ -871,6 +926,8 @@
         sessionStartTime: session?.startTime || 0,
         startupBufferSeconds: session?.startupTargetSeconds || 0,
         startupWaitingEvents: session?.startupWaitingEvents || 0,
+        bufferAheadLimit: session?.bufferAheadLimit || 0,
+        urlDeadline: urlDeadlineSeconds(),
         progressiveAppends: session?.progressiveAppends || 0,
         seekReloads,
         lastSeekMs: Math.round(lastSeekMs),

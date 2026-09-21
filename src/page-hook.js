@@ -62,7 +62,7 @@
   let transferSequence = 1;
   const transfers = new Map();
   const stats = {
-    version: "0.9.2.3",
+    version: "0.9.3.0",
     architecture: "bilibili-native-ui-progressive-mse-0.8-core",
     mode: settings.mode,
     playerState: "waiting",
@@ -497,6 +497,31 @@
       }
       return nativeXhrSend.apply(this, args);
     };
+  }
+
+  // Bilibili's signed download addresses expire (their deadline parameter). A long pause
+  // used to run into that: every node answers 403 at once, a ban round starts and the video
+  // stalls. New addresses are requested shortly before the old ones expire instead.
+  let deadlineRefresh = { route: "", deadline: 0, at: 0 };
+  async function refreshExpiringPlayinfo() {
+    if (!player || !playerRoute || typeof player.urlDeadlineSeconds !== "function") return;
+    const identity = routeIdentity();
+    if (!identity || identity.key !== playerRoute) return;
+    const deadline = player.urlDeadlineSeconds() || 0;
+    if (!deadline || Date.now() / 1000 < deadline - 120) return;
+    const now = Date.now();
+    if (deadlineRefresh.route === playerRoute && now - deadlineRefresh.at < 45000) return;
+    deadlineRefresh = { route: playerRoute, deadline, at: now };
+    const route = playerRoute;
+    const lifecycle = playerLifecycle;
+    notices?.log("下载地址快要过期了", "正在向 B 站请求新的下载地址，播放不受影响。", "info", "", route, "download");
+    try {
+      const playinfo = await fetchRoutePlayinfo(identity, null);
+      if (lifecycle !== playerLifecycle || playerRoute !== route || routeIdentity()?.key !== route) return;
+      await player.updatePlayinfo?.(playinfo);
+    } catch (error) {
+      notices?.log("没能提前换新下载地址", `${String(error?.message || error).slice(0, 120)}\n播放继续使用现在的地址，稍后再试。`, "info", "", route, "download");
+    }
   }
 
   async function fetchRoutePlayinfo(identity, signal) {
@@ -1204,6 +1229,7 @@
     else {
       syncNativeQuality();
       syncNativeCodec();
+      refreshExpiringPlayinfo();
     }
     updateNativeInfoPanel();
     syncSettingsMenu();
@@ -1227,7 +1253,7 @@
           state: stats.playerState, lastError: stats.lastError, player: rest, nodes: stats.cdnHosts.map((item) => ({ ...item })), bannedNodes: cdnBans?.hosts?.() || [], page: pageEvents.slice(), timeline
         }, null, 1);
       },
-      version: "0.9.2.3"
+      version: "0.9.3.0"
     })
   });
   publish();

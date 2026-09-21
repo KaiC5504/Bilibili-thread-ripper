@@ -223,17 +223,25 @@
         });
       if (!pool.length) return urls();
       const firstRange = mediaRangeCount === 0;
-      const width = Math.min(firstRange ? pool.length : 3, pool.length);
+      const width = Math.min(firstRange ? pool.length : 6, pool.length);
       let selected;
       const warmupRanges = getMode?.() === "mainland" ? 1 : 4;
       if (mediaRangeCount < warmupRanges) {
         selected = pool.slice(0, width);
         rangeCursor = width % pool.length;
       } else {
-        const offset = rangeCursor % pool.length;
-        const rotated = pool.slice(offset).concat(pool.slice(0, offset));
-        selected = rotated.slice(0, width);
-        rangeCursor = (rangeCursor + width) % pool.length;
+        // After the warm-up the measured nodes carry the segments in speed order; the
+        // downloader gives the fast ones the larger share. One untested node rides along
+        // per segment, so a route that has never answered still gets its chance.
+        const measured = pool.filter((url) => health.get(url)?.lastSuccessAt);
+        const rest = pool.filter((url) => !health.get(url)?.lastSuccessAt);
+        const explore = rest.length ? [rest[rangeCursor % rest.length]] : [];
+        rangeCursor = (rangeCursor + 1) % Math.max(1, pool.length);
+        selected = [...measured.slice(0, width - explore.length), ...explore];
+        for (const url of pool) {
+          if (selected.length >= Math.min(3, pool.length)) break;
+          if (!selected.includes(url)) selected.push(url);
+        }
       }
       mediaRangeCount += 1;
       return selected;
@@ -306,7 +314,9 @@
     }
 
     const allows = (url) => !bans || bans.allows(url);
-    return Object.freeze({ allows, failure, ordered, rangeCandidates, rescueCandidates, startupCandidates, status, success, urls });
+    // The measured download speed of an address, for weighting piece assignments.
+    const speed = (url) => health.get(url)?.bps || 0;
+    return Object.freeze({ allows, failure, ordered, rangeCandidates, rescueCandidates, speed, startupCandidates, status, success, urls });
   }
 
   root.__BILI_CDN_RESOLVER_FACTORY__ = Object.freeze({
