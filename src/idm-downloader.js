@@ -8,6 +8,9 @@
   const PIECE_RETRY_WINDOW_MS = 25000;
   // Below this a resumed request saves less than its own round trip costs.
   const RESUME_MIN_BYTES = 32 * 1024;
+  // A shorter transfer is mostly round trip. The tail of a resumed piece can be a few KiB,
+  // and counting it would mark down the very node that came to the rescue.
+  const SPEED_SAMPLE_MIN_BYTES = 48 * 1024;
 
   function abortError(reason) {
     if (reason instanceof Error || reason instanceof DOMException) return reason;
@@ -93,7 +96,7 @@
     // takes. Sub-chunk sizing and the hedge delay follow these measurements.
     const meter = { connectionBps: 0, pieceMs: 0 };
     function recordMeter(bytes, elapsedMs) {
-      if (bytes < 48 * 1024 || elapsedMs <= 0) return;
+      if (bytes < SPEED_SAMPLE_MIN_BYTES || elapsedMs <= 0) return;
       const bps = bytes * 1000 / elapsedMs;
       meter.connectionBps = meter.connectionBps ? meter.connectionBps * 0.7 + bps * 0.3 : bps;
       meter.pieceMs = meter.pieceMs ? meter.pieceMs * 0.7 + elapsedMs * 0.3 : elapsedMs;
@@ -169,9 +172,23 @@
       return bytes;
     }
 
-    async function attempt(piece, url, signal, kind, resolver, priority = 0, received = { bytes: 0, chunks: [] }) {
+    // begin: called once the request has its connection slot, and returns what to ask for.
+    // A copy that waited in the queue resumes from what the first copy has received by then,
+    // not from what it had when the copy was queued.
+    async function attempt(piece, url, signal, kind, resolver, priority = 0, begin = null) {
       const settings = config();
       const release = await semaphore.acquire(signal, priority);
+      let received = { bytes: 0, chunks: [] };
+      if (begin) {
+        try {
+          const plan = begin();
+          piece = plan.part;
+          received = plan.recorder;
+        } catch (error) {
+          release();
+          throw error;
+        }
+      }
       const controller = new AbortController();
       const cancel = () => controller.abort(abortError(signal?.reason));
       if (signal?.aborted) cancel();
@@ -202,13 +219,21 @@
         if (bytes.byteLength !== piece.length) throw new Error(`子块长度不符：${bytes.byteLength}/${piece.length}`);
         const elapsedMs = Math.max(1, performance.now() - startedAt);
         recordMeter(bytes.byteLength, elapsedMs);
-        resolver.success(url, bytes.byteLength * 1000 / elapsedMs);
+        // The node answered either way; only a large enough transfer says how fast it is.
+        resolver.success(url, bytes.byteLength >= SPEED_SAMPLE_MIN_BYTES ? bytes.byteLength * 1000 / elapsedMs : 0);
         onTransfer({ phase: "done", id: transferId });
         return { bytes, total: contentRange.total, url };
       } catch (error) {
+        const canceled = error?.name === "AbortError";
+        // A copy that lost the race was cut off, not broken, and what it had received by then
+        // is a measurement of its node. Without it a slow node is never measured at all: its
+        // pieces are always finished by a faster copy first, and an unmeasured node only ever
+        // gets trial pieces.
+        if (canceled && received.bytes >= SPEED_SAMPLE_MIN_BYTES && typeof resolver.sample === "function") {
+          resolver.sample(url, received.bytes * 1000 / Math.max(1, performance.now() - startedAt));
+        }
         // Received bytes tell a dead node (0 KiB) apart from a transfer that stalled midway.
         resolver.failure(url, error, received.bytes);
-        const canceled = error?.name === "AbortError";
         onTransfer({ phase: canceled ? "cancel" : "error", id: transferId, error });
         throw error;
       } finally {
@@ -340,21 +365,27 @@
               if (controllers[pairIndex].signal.aborted) canceled();
               else controllers[pairIndex].signal.addEventListener("abort", canceled, { once: true });
             });
-            // Resume from the longest prefix known right now: an earlier failed attempt,
-            // or what the still-running first copy has already received.
-            let base = prefix && prefix.bytes >= RESUME_MIN_BYTES ? prefix : null;
-            if (pairIndex) {
-              const live = liveProgress(contexts[0]);
-              if (live && live.bytes >= RESUME_MIN_BYTES && live.bytes > (base?.bytes || 0)) base = live;
-            }
-            if (base && base.bytes >= piece.length) base = null;
+            // Resume from the longest prefix known when the request really starts: an earlier
+            // failed attempt, or what the still-running first copy has received by then.
+            let base = null;
             const recorder = { bytes: 0, chunks: [] };
-            contexts[pairIndex] = { base, recorder };
-            const part = base
-              ? { index: piece.index, start: piece.start + base.bytes, end: piece.end, length: piece.length - base.bytes }
-              : piece;
+            const begin = () => {
+              base = prefix && prefix.bytes >= RESUME_MIN_BYTES ? prefix : null;
+              if (pairIndex) {
+                const live = liveProgress(contexts[0]);
+                if (live && live.bytes >= RESUME_MIN_BYTES && live.bytes > (base?.bytes || 0)) base = live;
+              }
+              if (base && base.bytes >= piece.length) base = null;
+              contexts[pairIndex] = { base, recorder };
+              return {
+                recorder,
+                part: base
+                  ? { index: piece.index, start: piece.start + base.bytes, end: piece.end, length: piece.length - base.bytes }
+                  : piece
+              };
+            };
             try {
-              const result = await attempt(part, url, controllers[pairIndex].signal, kind, resolver, priority + (pairIndex ? 20 : 0), recorder);
+              const result = await attempt(piece, url, controllers[pairIndex].signal, kind, resolver, priority + (pairIndex ? 20 : 0), begin);
               return base
                 ? { bytes: core.concatChunks([...base.chunks, result.bytes], piece.length), total: result.total, url: result.url }
                 : result;
@@ -430,37 +461,70 @@
       }
     }
 
-    // Which address each piece tries first. The fastest node gets the most pieces, a node
-    // without a measurement gets the average of the measured ones, and a node measured at
-    // under a twelfth of the best is left out entirely: a piece it starts has to be rescued
-    // anyway. Slow and untested nodes come back through the resolver's exploration slot.
+    // Which address each piece tries first. The fastest node gets the most pieces, and a node
+    // measured at under a twelfth of the best is left out entirely: a piece it starts has to
+    // be rescued anyway. Its measurement goes stale after a while, and the resolver's
+    // exploration slot then gives it, like any untested node, another try.
+    let assignTurn = 0;
+    // Trials are counted per resolver: the video and the audio track take turns on this
+    // downloader, and one shared count could leave a track without a trial for good.
+    const trialStates = new WeakMap();
     function assignPrimaries(urls, resolver, count) {
       if (!urls.length || count <= 0) return [];
       if (urls.length === 1) return new Array(count).fill(urls[0]);
+      // Each range opens one node further on, so ranges in flight together do not all
+      // send their first pieces to the same node.
+      const turn = assignTurn;
+      assignTurn = (assignTurn + 1) % 4096;
       const measure = typeof resolver.speed === "function" ? (url) => Math.max(0, Number(resolver.speed(url)) || 0) : () => 0;
       let known = urls.map(measure);
       const positive = known.filter((value) => value > 0);
-      if (!positive.length) return Array.from({ length: count }, (_ignored, index) => urls[index % urls.length]);
+      if (!positive.length) return Array.from({ length: count }, (_ignored, index) => urls[(index + turn) % urls.length]);
       const top = Math.max(...known);
       const eligible = urls.filter((_url, index) => !known[index] || known[index] >= top / 12);
       if (eligible.length && eligible.length < urls.length) {
         urls = eligible;
         known = urls.map(measure);
       }
-      const fallback = positive.reduce((sum, value) => sum + value, 0) / positive.length;
-      const weights = known.map((value) => Math.max(value || fallback, top * 0.05));
-      const total = weights.reduce((sum, value) => sum + value, 0);
-      const primaries = [];
-      let urlIndex = 0;
-      let covered = weights[0];
-      for (let index = 0; index < count; index += 1) {
-        const point = (index + 0.5) * total / count;
-        while (covered < point && urlIndex < urls.length - 1) {
-          urlIndex += 1;
-          covered += weights[urlIndex];
-        }
-        primaries.push(urls[urlIndex]);
+      // A node without a measurement is a trial. It gets a piece or two from the end of the
+      // range, which are needed last and may take longest, enough to measure it and cheap
+      // when it turns out to be slow. With very few pieces there is none to spare.
+      const unknown = urls.filter((_url, index) => !known[index]);
+      let trials = Math.min(unknown.length * 2, Math.floor(count / 4));
+      let trialState = trialStates.get(resolver);
+      if (!trialState) trialStates.set(resolver, trialState = { waited: 0, cursor: 0 });
+      // Small segments never have a piece to spare, and a node left out for being slow would
+      // stay unmeasured for good. Every fourth such range gives up its last piece for a trial.
+      if (!trials && unknown.length && count >= 2) {
+        trialState.waited += 1;
+        if (trialState.waited >= 4) trials = 1;
       }
+      if (trials) trialState.waited = 0;
+      if (unknown.length) {
+        urls = urls.filter((_url, index) => known[index]);
+        known = urls.map(measure);
+        count -= trials;
+      }
+      const weights = known.map((value) => Math.max(value, top * 0.05));
+      const total = weights.reduce((sum, value) => sum + value, 0);
+      // Handed out in turns (smooth weighted round-robin), not in one block per node. The
+      // pieces with the lowest numbers get the free connections first, and the player has
+      // several segments in flight: with blocks, every segment's first pieces went to the
+      // same node and the others sat idle.
+      const primaries = [];
+      const credit = weights.map(() => 0);
+      const order = urls.map((_url, index) => (index + turn) % urls.length);
+      for (let index = 0; index < count; index += 1) {
+        let best = order[0];
+        for (const urlIndex of order) {
+          credit[urlIndex] += weights[urlIndex];
+          if (credit[urlIndex] > credit[best]) best = urlIndex;
+        }
+        credit[best] -= total;
+        primaries.push(urls[best]);
+      }
+      for (let index = 0; index < trials; index += 1) primaries.push(unknown[(index + trialState.cursor) % unknown.length]);
+      trialState.cursor = (trialState.cursor + trials) % 4096;
       return primaries;
     }
 
@@ -562,8 +626,13 @@
         return flushOperation;
       };
       // The probe measured at least its own winner, so the pieces spread over the nodes by
-      // speed at once; the proven address stays each piece's first fallback.
-      const primaries = assignPrimaries(candidateUrls, resolver, pieces.length);
+      // speed at once; the proven address stays each piece's first fallback. Only addresses
+      // that have delivered carry the first segment: a node whose probe never finished would
+      // otherwise get a share of it and hold up the start. The others stay available for
+      // rescue, and later ranges try them.
+      const measured = typeof resolver.speed === "function" ? (url) => resolver.speed(url) > 0 : () => false;
+      const provenUrls = candidateUrls.filter((url) => url === headResult.url || measured(url));
+      const primaries = assignPrimaries(provenUrls.length ? provenUrls : [headResult.url], resolver, pieces.length);
       const pendingPieces = pieces.map(async (piece, orderedIndex) => {
         const result = await downloadPiece(
           piece,

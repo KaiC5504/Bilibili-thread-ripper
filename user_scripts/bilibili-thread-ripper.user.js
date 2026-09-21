@@ -423,8 +423,42 @@ const chrome = (() => {
     });
   }
 
+  // How long a measured speed counts. A node in use is measured again with every segment; one
+  // that was left out for being slow goes back to the untested ones after this, and gets
+  // another try through the exploration slot.
+  const MEASUREMENT_TTL_MS = 90000;
+
   function createResolver(representation, getMode, bans = null, getCustomHosts = null) {
     const health = new Map();
+    // What is known about a node's speed, per node and file, without the query. An address
+    // with a fresh signature is the same route, so it starts with what its predecessor
+    // measured. Failures are not kept here: those belong to the address they happened on.
+    const routes = new Map();
+    const routeKeys = new Map();
+    const routeOf = (url) => {
+      let key = routeKeys.get(url);
+      if (!key) {
+        try {
+          const parsed = new URL(url);
+          key = `${parsed.host}${parsed.pathname}`;
+        } catch (_error) { key = String(url); }
+        if (routeKeys.size > 512) routeKeys.clear();
+        routeKeys.set(url, key);
+      }
+      return key;
+    };
+    const measurement = (url) => routes.get(routeOf(url)) || null;
+    // Only a transfer long enough to measure a speed renews it. The short tail of a resumed
+    // piece proves the node works, and must not keep an old speed alive for ever.
+    const measuredNow = (url, now = Date.now()) => {
+      const item = measurement(url);
+      return Boolean(item?.lastMeasuredAt) && now - item.lastMeasuredAt < MEASUREMENT_TTL_MS;
+    };
+    const bySpeed = (a, b) => {
+      const am = measurement(a) || {};
+      const bm = measurement(b) || {};
+      return Number(Boolean(bm.lastSuccessAt)) - Number(Boolean(am.lastSuccessAt)) || (bm.bps || 0) - (am.bps || 0);
+    };
     let cursor = 0;
     let mediaRangeCount = 0;
     let rangeCursor = 0;
@@ -461,12 +495,7 @@ const chrome = (() => {
       const now = Date.now();
       const pool = urls()
         .filter((url) => (health.get(url)?.blockedUntil || 0) <= now)
-        .sort((a, b) => {
-          const ah = health.get(a) || {};
-          const bh = health.get(b) || {};
-          return Number(Boolean(bh.lastSuccessAt)) - Number(Boolean(ah.lastSuccessAt)) ||
-            (bh.bps || 0) - (ah.bps || 0);
-        });
+        .sort(bySpeed);
       if (!pool.length) return urls();
       const firstRange = mediaRangeCount === 0;
       const width = Math.min(firstRange ? pool.length : 6, pool.length);
@@ -477,12 +506,17 @@ const chrome = (() => {
         rangeCursor = width % pool.length;
       } else {
         // After the warm-up the measured nodes carry the segments in speed order; the
-        // downloader gives the fast ones the larger share. One untested node rides along
-        // per segment, so a route that has never answered still gets its chance.
-        const measured = pool.filter((url) => health.get(url)?.lastSuccessAt);
-        const rest = pool.filter((url) => !health.get(url)?.lastSuccessAt);
-        const explore = rest.length ? [rest[rangeCursor % rest.length]] : [];
-        rangeCursor = (rangeCursor + 1) % Math.max(1, pool.length);
+        // downloader gives the fast ones the larger share. One other node rides along per
+        // segment: one that never answered, or one whose measurement has gone stale because
+        // it was too slow to be used. Routes change, so a slow node is not slow for good.
+        // While fewer nodes are measured than a segment uses, the free places go to the others
+        // as well: the downloader gives an unmeasured node only a trial piece or two, so
+        // finding the good nodes quickly costs little.
+        const measured = pool.filter((url) => measuredNow(url, now));
+        const rest = pool.filter((url) => !measuredNow(url, now));
+        const places = Math.min(rest.length, Math.max(1, width - measured.length));
+        const explore = Array.from({ length: places }, (_item, index) => rest[(rangeCursor + index) % rest.length]);
+        rangeCursor = (rangeCursor + places) % Math.max(1, pool.length);
         selected = [...measured.slice(0, width - explore.length), ...explore];
         for (const url of pool) {
           if (selected.length >= Math.min(3, pool.length)) break;
@@ -512,21 +546,32 @@ const chrome = (() => {
       const now = Date.now();
       return urls()
         .filter((url) => (health.get(url)?.blockedUntil || 0) <= now)
-        .sort((a, b) => {
-          const ah = health.get(a) || {};
-          const bh = health.get(b) || {};
-          return Number(Boolean(bh.lastSuccessAt)) - Number(Boolean(ah.lastSuccessAt)) ||
-            (bh.bps || 0) - (ah.bps || 0);
-        });
+        .sort(bySpeed);
     }
 
     function success(url, bps) {
       bans?.success?.(url);
-      const old = health.get(url) || {};
-      health.set(url, {
-        failures: 0,
-        blockedUntil: 0,
-        lastSuccessAt: Date.now(),
+      const old = measurement(url) || {};
+      const now = Date.now();
+      const measured = bps > 0;
+      health.set(url, { failures: 0, blockedUntil: 0, lastSuccessAt: now });
+      routes.set(routeOf(url), {
+        lastSuccessAt: now,
+        // No speed comes with a transfer too short to measure one; the last one stays, and
+        // keeps its age.
+        lastMeasuredAt: measured ? now : old.lastMeasuredAt || 0,
+        bps: !measured ? old.bps || 0 : old.bps ? old.bps * 0.65 + bps * 0.35 : bps
+      });
+    }
+
+    // The speed of a transfer that was cut off before its end. It says how fast the node is
+    // and nothing more: the address has not proven itself, and earlier failures stay.
+    function sample(url, bps) {
+      if (!(bps > 0)) return;
+      const old = measurement(url) || {};
+      routes.set(routeOf(url), {
+        lastSuccessAt: old.lastSuccessAt || 0,
+        lastMeasuredAt: Date.now(),
         bps: old.bps ? old.bps * 0.65 + bps * 0.35 : bps
       });
     }
@@ -553,16 +598,17 @@ const chrome = (() => {
         const nodeBanned = bans && !(bans.allowsNode ? bans.allowsNode(url) : bans.allows(url));
         return {
           host: new URL(url).hostname,
-          state: nodeBanned ? "banned" : (item.blockedUntil || 0) > now ? "blocked" : item.lastSuccessAt ? "healthy" : "untested",
-          bps: item.bps || 0
+          state: nodeBanned ? "banned" : (item.blockedUntil || 0) > now ? "blocked" : measurement(url)?.lastSuccessAt ? "healthy" : "untested",
+          bps: measurement(url)?.bps || 0
         };
       });
     }
 
     const allows = (url) => !bans || bans.allows(url);
-    // The measured download speed of an address, for weighting piece assignments.
-    const speed = (url) => health.get(url)?.bps || 0;
-    return Object.freeze({ allows, failure, ordered, rangeCandidates, rescueCandidates, speed, startupCandidates, status, success, urls });
+    // The measured download speed of an address, for weighting piece assignments. 0 when
+    // there is none or it has gone stale.
+    const speed = (url) => (measuredNow(url) ? measurement(url)?.bps || 0 : 0);
+    return Object.freeze({ allows, failure, ordered, rangeCandidates, rescueCandidates, sample, speed, startupCandidates, status, success, urls });
   }
 
   root.__BILI_CDN_RESOLVER_FACTORY__ = Object.freeze({
@@ -704,6 +750,9 @@ const chrome = (() => {
   const PIECE_RETRY_WINDOW_MS = 25000;
   // Below this a resumed request saves less than its own round trip costs.
   const RESUME_MIN_BYTES = 32 * 1024;
+  // A shorter transfer is mostly round trip. The tail of a resumed piece can be a few KiB,
+  // and counting it would mark down the very node that came to the rescue.
+  const SPEED_SAMPLE_MIN_BYTES = 48 * 1024;
 
   function abortError(reason) {
     if (reason instanceof Error || reason instanceof DOMException) return reason;
@@ -789,7 +838,7 @@ const chrome = (() => {
     // takes. Sub-chunk sizing and the hedge delay follow these measurements.
     const meter = { connectionBps: 0, pieceMs: 0 };
     function recordMeter(bytes, elapsedMs) {
-      if (bytes < 48 * 1024 || elapsedMs <= 0) return;
+      if (bytes < SPEED_SAMPLE_MIN_BYTES || elapsedMs <= 0) return;
       const bps = bytes * 1000 / elapsedMs;
       meter.connectionBps = meter.connectionBps ? meter.connectionBps * 0.7 + bps * 0.3 : bps;
       meter.pieceMs = meter.pieceMs ? meter.pieceMs * 0.7 + elapsedMs * 0.3 : elapsedMs;
@@ -865,9 +914,23 @@ const chrome = (() => {
       return bytes;
     }
 
-    async function attempt(piece, url, signal, kind, resolver, priority = 0, received = { bytes: 0, chunks: [] }) {
+    // begin: called once the request has its connection slot, and returns what to ask for.
+    // A copy that waited in the queue resumes from what the first copy has received by then,
+    // not from what it had when the copy was queued.
+    async function attempt(piece, url, signal, kind, resolver, priority = 0, begin = null) {
       const settings = config();
       const release = await semaphore.acquire(signal, priority);
+      let received = { bytes: 0, chunks: [] };
+      if (begin) {
+        try {
+          const plan = begin();
+          piece = plan.part;
+          received = plan.recorder;
+        } catch (error) {
+          release();
+          throw error;
+        }
+      }
       const controller = new AbortController();
       const cancel = () => controller.abort(abortError(signal?.reason));
       if (signal?.aborted) cancel();
@@ -898,13 +961,21 @@ const chrome = (() => {
         if (bytes.byteLength !== piece.length) throw new Error(`子块长度不符：${bytes.byteLength}/${piece.length}`);
         const elapsedMs = Math.max(1, performance.now() - startedAt);
         recordMeter(bytes.byteLength, elapsedMs);
-        resolver.success(url, bytes.byteLength * 1000 / elapsedMs);
+        // The node answered either way; only a large enough transfer says how fast it is.
+        resolver.success(url, bytes.byteLength >= SPEED_SAMPLE_MIN_BYTES ? bytes.byteLength * 1000 / elapsedMs : 0);
         onTransfer({ phase: "done", id: transferId });
         return { bytes, total: contentRange.total, url };
       } catch (error) {
+        const canceled = error?.name === "AbortError";
+        // A copy that lost the race was cut off, not broken, and what it had received by then
+        // is a measurement of its node. Without it a slow node is never measured at all: its
+        // pieces are always finished by a faster copy first, and an unmeasured node only ever
+        // gets trial pieces.
+        if (canceled && received.bytes >= SPEED_SAMPLE_MIN_BYTES && typeof resolver.sample === "function") {
+          resolver.sample(url, received.bytes * 1000 / Math.max(1, performance.now() - startedAt));
+        }
         // Received bytes tell a dead node (0 KiB) apart from a transfer that stalled midway.
         resolver.failure(url, error, received.bytes);
-        const canceled = error?.name === "AbortError";
         onTransfer({ phase: canceled ? "cancel" : "error", id: transferId, error });
         throw error;
       } finally {
@@ -1036,21 +1107,27 @@ const chrome = (() => {
               if (controllers[pairIndex].signal.aborted) canceled();
               else controllers[pairIndex].signal.addEventListener("abort", canceled, { once: true });
             });
-            // Resume from the longest prefix known right now: an earlier failed attempt,
-            // or what the still-running first copy has already received.
-            let base = prefix && prefix.bytes >= RESUME_MIN_BYTES ? prefix : null;
-            if (pairIndex) {
-              const live = liveProgress(contexts[0]);
-              if (live && live.bytes >= RESUME_MIN_BYTES && live.bytes > (base?.bytes || 0)) base = live;
-            }
-            if (base && base.bytes >= piece.length) base = null;
+            // Resume from the longest prefix known when the request really starts: an earlier
+            // failed attempt, or what the still-running first copy has received by then.
+            let base = null;
             const recorder = { bytes: 0, chunks: [] };
-            contexts[pairIndex] = { base, recorder };
-            const part = base
-              ? { index: piece.index, start: piece.start + base.bytes, end: piece.end, length: piece.length - base.bytes }
-              : piece;
+            const begin = () => {
+              base = prefix && prefix.bytes >= RESUME_MIN_BYTES ? prefix : null;
+              if (pairIndex) {
+                const live = liveProgress(contexts[0]);
+                if (live && live.bytes >= RESUME_MIN_BYTES && live.bytes > (base?.bytes || 0)) base = live;
+              }
+              if (base && base.bytes >= piece.length) base = null;
+              contexts[pairIndex] = { base, recorder };
+              return {
+                recorder,
+                part: base
+                  ? { index: piece.index, start: piece.start + base.bytes, end: piece.end, length: piece.length - base.bytes }
+                  : piece
+              };
+            };
             try {
-              const result = await attempt(part, url, controllers[pairIndex].signal, kind, resolver, priority + (pairIndex ? 20 : 0), recorder);
+              const result = await attempt(piece, url, controllers[pairIndex].signal, kind, resolver, priority + (pairIndex ? 20 : 0), begin);
               return base
                 ? { bytes: core.concatChunks([...base.chunks, result.bytes], piece.length), total: result.total, url: result.url }
                 : result;
@@ -1126,37 +1203,70 @@ const chrome = (() => {
       }
     }
 
-    // Which address each piece tries first. The fastest node gets the most pieces, a node
-    // without a measurement gets the average of the measured ones, and a node measured at
-    // under a twelfth of the best is left out entirely: a piece it starts has to be rescued
-    // anyway. Slow and untested nodes come back through the resolver's exploration slot.
+    // Which address each piece tries first. The fastest node gets the most pieces, and a node
+    // measured at under a twelfth of the best is left out entirely: a piece it starts has to
+    // be rescued anyway. Its measurement goes stale after a while, and the resolver's
+    // exploration slot then gives it, like any untested node, another try.
+    let assignTurn = 0;
+    // Trials are counted per resolver: the video and the audio track take turns on this
+    // downloader, and one shared count could leave a track without a trial for good.
+    const trialStates = new WeakMap();
     function assignPrimaries(urls, resolver, count) {
       if (!urls.length || count <= 0) return [];
       if (urls.length === 1) return new Array(count).fill(urls[0]);
+      // Each range opens one node further on, so ranges in flight together do not all
+      // send their first pieces to the same node.
+      const turn = assignTurn;
+      assignTurn = (assignTurn + 1) % 4096;
       const measure = typeof resolver.speed === "function" ? (url) => Math.max(0, Number(resolver.speed(url)) || 0) : () => 0;
       let known = urls.map(measure);
       const positive = known.filter((value) => value > 0);
-      if (!positive.length) return Array.from({ length: count }, (_ignored, index) => urls[index % urls.length]);
+      if (!positive.length) return Array.from({ length: count }, (_ignored, index) => urls[(index + turn) % urls.length]);
       const top = Math.max(...known);
       const eligible = urls.filter((_url, index) => !known[index] || known[index] >= top / 12);
       if (eligible.length && eligible.length < urls.length) {
         urls = eligible;
         known = urls.map(measure);
       }
-      const fallback = positive.reduce((sum, value) => sum + value, 0) / positive.length;
-      const weights = known.map((value) => Math.max(value || fallback, top * 0.05));
-      const total = weights.reduce((sum, value) => sum + value, 0);
-      const primaries = [];
-      let urlIndex = 0;
-      let covered = weights[0];
-      for (let index = 0; index < count; index += 1) {
-        const point = (index + 0.5) * total / count;
-        while (covered < point && urlIndex < urls.length - 1) {
-          urlIndex += 1;
-          covered += weights[urlIndex];
-        }
-        primaries.push(urls[urlIndex]);
+      // A node without a measurement is a trial. It gets a piece or two from the end of the
+      // range, which are needed last and may take longest, enough to measure it and cheap
+      // when it turns out to be slow. With very few pieces there is none to spare.
+      const unknown = urls.filter((_url, index) => !known[index]);
+      let trials = Math.min(unknown.length * 2, Math.floor(count / 4));
+      let trialState = trialStates.get(resolver);
+      if (!trialState) trialStates.set(resolver, trialState = { waited: 0, cursor: 0 });
+      // Small segments never have a piece to spare, and a node left out for being slow would
+      // stay unmeasured for good. Every fourth such range gives up its last piece for a trial.
+      if (!trials && unknown.length && count >= 2) {
+        trialState.waited += 1;
+        if (trialState.waited >= 4) trials = 1;
       }
+      if (trials) trialState.waited = 0;
+      if (unknown.length) {
+        urls = urls.filter((_url, index) => known[index]);
+        known = urls.map(measure);
+        count -= trials;
+      }
+      const weights = known.map((value) => Math.max(value, top * 0.05));
+      const total = weights.reduce((sum, value) => sum + value, 0);
+      // Handed out in turns (smooth weighted round-robin), not in one block per node. The
+      // pieces with the lowest numbers get the free connections first, and the player has
+      // several segments in flight: with blocks, every segment's first pieces went to the
+      // same node and the others sat idle.
+      const primaries = [];
+      const credit = weights.map(() => 0);
+      const order = urls.map((_url, index) => (index + turn) % urls.length);
+      for (let index = 0; index < count; index += 1) {
+        let best = order[0];
+        for (const urlIndex of order) {
+          credit[urlIndex] += weights[urlIndex];
+          if (credit[urlIndex] > credit[best]) best = urlIndex;
+        }
+        credit[best] -= total;
+        primaries.push(urls[best]);
+      }
+      for (let index = 0; index < trials; index += 1) primaries.push(unknown[(index + trialState.cursor) % unknown.length]);
+      trialState.cursor = (trialState.cursor + trials) % 4096;
       return primaries;
     }
 
@@ -1258,8 +1368,13 @@ const chrome = (() => {
         return flushOperation;
       };
       // The probe measured at least its own winner, so the pieces spread over the nodes by
-      // speed at once; the proven address stays each piece's first fallback.
-      const primaries = assignPrimaries(candidateUrls, resolver, pieces.length);
+      // speed at once; the proven address stays each piece's first fallback. Only addresses
+      // that have delivered carry the first segment: a node whose probe never finished would
+      // otherwise get a share of it and hold up the start. The others stay available for
+      // rescue, and later ranges try them.
+      const measured = typeof resolver.speed === "function" ? (url) => resolver.speed(url) > 0 : () => false;
+      const provenUrls = candidateUrls.filter((url) => url === headResult.url || measured(url));
+      const primaries = assignPrimaries(provenUrls.length ? provenUrls : [headResult.url], resolver, pieces.length);
       const pendingPieces = pieces.map(async (piece, orderedIndex) => {
         const result = await downloadPiece(
           piece,
@@ -1385,6 +1500,12 @@ const chrome = (() => {
   const STARTUP_BUFFER_MAX_SECONDS = 10;
   const STARTUP_RECOVERY_SECONDS = 6;
   const STARTUP_PROTECTION_MS = 20000;
+  // When the browser's buffer quota is hit: the forward buffer is never brought below the
+  // floor, and a full buffer with less than this ahead is a failure, not something to wait out.
+  const QUOTA_AHEAD_FLOOR_SECONDS = 8;
+  const QUOTA_FATAL_AHEAD_SECONDS = 10;
+  // A video whose buffer stays full through this many waits is given up after all.
+  const QUOTA_MAX_WAITS = 8;
   const QUALITY_NAMES = Object.freeze({
     127: "8K", 126: "杜比视界", 125: "HDR", 120: "4K", 116: "1080P 60帧",
     112: "1080P 高码率", 80: "1080P", 74: "720P 60帧", 64: "720P",
@@ -1573,6 +1694,10 @@ const chrome = (() => {
     let preferredCodec = normalizeCodec(options.preferredCodec);
     let selection = selectRepresentations(currentPlayinfo, preferredQuality, preferredCodec);
     let selectedVideo = selection.preferred;
+    // The two representation objects the running session downloads from. Its resolvers keep
+    // reading them, so fresh addresses always go into these two and never into a newer
+    // selection's copies.
+    let selectedAudio = selection.audio;
     let sessionStarts = 0;
     let session = null;
     let destroyed = false;
@@ -1670,7 +1795,7 @@ const chrome = (() => {
           if (error?.name !== "QuotaExceededError") throw error;
           const current = Number(video.currentTime) || 0;
           const ahead = Math.max(0, bufferedEndAt(track.sourceBuffer, current) - current);
-          candidate.bufferAheadLimit = Math.max(15, Math.min(candidate.bufferAheadLimit || Infinity, ahead * 0.75));
+          candidate.bufferAheadLimit = Math.max(QUOTA_AHEAD_FLOOR_SECONDS, Math.min(candidate.bufferAheadLimit || Infinity, ahead * 0.75));
           note("buffer quota hit", `${track.kind} keeps ${candidate.bufferAheadLimit.toFixed(0)}s ahead`);
           options.onLog?.("浏览器缓冲区满了", `已释放播放过的数据，这个视频接下来最多提前缓冲 ${candidate.bufferAheadLimit.toFixed(0)} 秒。`, "info", "buffer");
           const behindEnd = Math.max(0, current - 5);
@@ -1679,7 +1804,15 @@ const chrome = (() => {
             await waitEvent(track.sourceBuffer, "updateend", "error", candidate.controller.signal);
           }
           if (!sessionIsCurrent(candidate) || generation !== candidate.generation) return;
-          track.sourceBuffer.appendBuffer(bytes);
+          try {
+            track.sourceBuffer.appendBuffer(bytes);
+          } catch (again) {
+            if (again?.name !== "QuotaExceededError") throw again;
+            // Nothing played is left to free: what is buffered ahead fills the quota by
+            // itself. This write ends here so the buffer's queue stays free; the caller
+            // keeps the bytes and writes them once playback has used up some of the buffer.
+            throw Object.assign(again, { bufferFull: true, aheadSeconds: ahead });
+          }
         }
         await waitEvent(track.sourceBuffer, "updateend", "error", candidate.controller.signal);
       });
@@ -1777,10 +1910,16 @@ const chrome = (() => {
       ensureBuffer(candidate);
     }
 
-    // How far ahead this session may buffer: the setting, brought down when the
+    // How far ahead this session may buffer: the setting, brought down each time the
     // browser's own buffer quota was hit.
     function aheadTarget(candidate) {
       return Math.min(core.normalizeSettings(getSettings()).bufferAheadSeconds, candidate.bufferAheadLimit || Infinity);
+    }
+
+    // The buffer a start or a recovery waits for must be one the tracks can still reach: with
+    // the limit brought down to eight seconds, waiting for ten would never end.
+    function reachableSeconds(candidate, seconds) {
+      return Math.min(seconds, Math.max(0.5, aheadTarget(candidate) - 2));
     }
 
     async function fillTrack(candidate, track) {
@@ -1805,7 +1944,7 @@ const chrome = (() => {
             const segment = track.sidx.segments[index];
             if (!segment || projectedEnd - current >= aheadTarget(candidate)) break;
             projectedEnd = segment.endTime;
-            if (track.prefetches.has(index)) continue;
+            if (track.prefetches.has(index) || track.held?.index === index) continue;
             const startup = !track.startupComplete && index === track.startupIndex;
             track.prefetches.set(index, segmentDownload(candidate, track, segment, index, {
               priority: startup ? 120 : Math.max(30, 55 - offset * 5),
@@ -1817,6 +1956,9 @@ const chrome = (() => {
                 track.startupScheduled = true;
                 maybeStartStartupPrefetch(candidate);
               } : null,
+              // The first segment is written piece by piece as it arrives. A full buffer here,
+              // with next to nothing buffered yet, ends the download and the takeover as it
+              // always did; only whole segments further on are kept and written later.
               onOrderedChunk: startup ? async (bytes) => {
                 if (!sessionIsCurrent(candidate) || generation !== candidate.generation || signal.aborted) return;
                 candidate.progressiveAppends += 1;
@@ -1825,13 +1967,28 @@ const chrome = (() => {
               } : null
             }));
           }
-          const pending = track.prefetches.get(track.nextIndex);
-          if (!pending) break;
-          const settled = await pending;
-          track.prefetches.delete(settled.index);
+          // A segment the buffer had no room for comes first. The check at the top of this
+          // loop let it through, so playback has used up a quarter of what was buffered since.
+          const pending = track.held ? null : track.prefetches.get(track.nextIndex);
+          if (!track.held && !pending) break;
+          const settled = track.held || await pending;
+          if (!track.held) track.prefetches.delete(settled.index);
           if (settled.error) throw settled.error;
           if (!sessionIsCurrent(candidate) || generation !== candidate.generation || signal.aborted) break;
-          if (!settled.result.streamed) await append(candidate, track, settled.result.bytes, generation);
+          if (!settled.result.streamed) {
+            try {
+              await append(candidate, track, settled.result.bytes, generation);
+              track.held = null;
+            } catch (error) {
+              // With this little buffered there is nothing left to give up, and waiting
+              // would only stall the video: that stays a failure, as it always was.
+              if (!error?.bufferFull || error.aheadSeconds < QUOTA_FATAL_AHEAD_SECONDS) throw error;
+              candidate.quotaWaits += 1;
+              if (candidate.quotaWaits > QUOTA_MAX_WAITS) throw error;
+              track.held = settled;
+              break;
+            }
+          }
           if (!track.startupComplete && settled.index === track.startupIndex) {
             note("first segment in", `${track.kind} ${Math.round(settled.result.byteLength / 1024)} KiB in ${settled.result.pieceCount} pieces`);
             track.startupComplete = true;
@@ -1921,7 +2078,7 @@ const chrome = (() => {
       candidate.startTime = target;
       if (!candidate.tracks.every((track) => isBufferedAt(track.sourceBuffer, target))) return;
       const ends = candidate.tracks.map((track) => bufferedEndAt(track.sourceBuffer, target));
-      const required = updateStartupProfile(candidate);
+      const required = reachableSeconds(candidate, updateStartupProfile(candidate));
       const remaining = Math.max(0.5, (Number(candidate.mediaSource.duration) || target + required) - target);
       if (Math.min(...ends) - target < Math.max(0.5, Math.min(required, remaining))) return;
       candidate.playbackActivated = true;
@@ -1952,7 +2109,7 @@ const chrome = (() => {
       const ahead = ready ? Math.max(0, Math.min(...candidate.tracks.map((track) => bufferedEndAt(track.sourceBuffer, current))) - current) : 0;
       if (candidate.recovering && ready) {
         const remaining = Math.max(0.5, (Number(candidate.mediaSource.duration) || current + candidate.recoveryTargetSeconds) - current);
-        if (ahead >= Math.min(candidate.recoveryTargetSeconds, remaining)) {
+        if (ahead >= Math.min(reachableSeconds(candidate, candidate.recoveryTargetSeconds), remaining)) {
           candidate.recovering = false;
           options.onLog?.("缓冲补好了，可以继续播放", `已经备好接下来 ${ahead.toFixed(1)} 秒的数据。`, "success", "buffer");
           candidate.playAttempted = false;
@@ -2001,7 +2158,10 @@ const chrome = (() => {
       if (destroyed) return;
       options.onLog?.("正在准备播放器", `使用 ${qualityLabel(representation)} 清晰度，从 ${Number(playbackState.time || 0).toFixed(2)} 秒开始。`, "info", "takeover");
       const previous = session;
+      // Read once: selection can be replaced by a new playinfo while this session starts.
+      const audio = selection.audio;
       selectedVideo = representation;
+      selectedAudio = audio;
       sessionStarts += 1;
       note("session", `${qualityLabel(representation)} ${codecFamily(representation)} from ${Number(playbackState.time || 0).toFixed(1)}`);
       const mediaSource = new MediaSource();
@@ -2011,7 +2171,7 @@ const chrome = (() => {
         controller: new AbortController(), mediaSource, objectUrl,
         timer: null, endRetryTimer: null, tracks: [], ending: false, streamEnded: false,
         playAttempted: false, playbackActivated: false, playbackActivatedAt: 0,
-        recovering: false, recoveryTargetSeconds: STARTUP_RECOVERY_SECONDS, bufferAheadLimit: 0,
+        recovering: false, recoveryTargetSeconds: STARTUP_RECOVERY_SECONDS, bufferAheadLimit: 0, quotaWaits: 0,
         startupCompletedBytes: 0, startupPrefetchLaunched: false, startupStartedAt: performance.now(),
         progressiveAppends: 0,
         startupTargetSeconds: 6, startupThroughputBps: 0, mediaBytesPerSecond: 0,
@@ -2022,7 +2182,7 @@ const chrome = (() => {
         internalSeekTarget: null,
         // One ban list per video, shared by every quality and by the audio track.
         videoResolver: resolverFactory.createResolver(representation, () => core.normalizeSettings(getSettings()).mode, options.cdnBans, () => core.normalizeSettings(getSettings()).customHosts),
-        audioResolver: resolverFactory.createResolver(selection.audio, () => core.normalizeSettings(getSettings()).mode, options.cdnBans, () => core.normalizeSettings(getSettings()).customHosts)
+        audioResolver: resolverFactory.createResolver(audio, () => core.normalizeSettings(getSettings()).mode, options.cdnBans, () => core.normalizeSettings(getSettings()).customHosts)
       };
       session = candidate;
       if (previous) disposeSession(previous, false);
@@ -2039,10 +2199,10 @@ const chrome = (() => {
         if (mediaSource.readyState !== "open") await waitEvent(mediaSource, "sourceopen", "error", candidate.controller.signal);
         if (!sessionIsCurrent(candidate)) return;
         const videoBuffer = mediaSource.addSourceBuffer(mimeFor(representation, "video"));
-        const audioBuffer = mediaSource.addSourceBuffer(mimeFor(selection.audio, "audio"));
+        const audioBuffer = mediaSource.addSourceBuffer(mimeFor(audio, "audio"));
         const [videoTrack, audioTrack] = await Promise.all([
           loadTrack(candidate, "video", representation, candidate.videoResolver, videoBuffer, candidate.startTime),
-          loadTrack(candidate, "audio", selection.audio, candidate.audioResolver, audioBuffer, candidate.startTime)
+          loadTrack(candidate, "audio", audio, candidate.audioResolver, audioBuffer, candidate.startTime)
         ]);
         if (!sessionIsCurrent(candidate)) return;
         candidate.tracks = [videoTrack, audioTrack];
@@ -2158,8 +2318,29 @@ const chrome = (() => {
     // A refreshed playinfo names the same files with fresh signatures. The resolvers of a
     // running session keep reading their representation objects, so those objects receive
     // the new addresses; nothing else about the session changes.
+    function deadlineOf(representation) {
+      try { return Number(new URL(representationUrl(representation)).searchParams.get("deadline")) || 0; }
+      catch (_error) { return 0; }
+    }
+
+    // Whether a playinfo names, for any file already known, an address that expires sooner.
+    function namesOlderAddresses(playinfo) {
+      const listed = (item) => {
+        const dash = dashBody(item)?.dash;
+        return [...(dash?.video || []), ...(dash?.audio || [])];
+      };
+      const known = [...listed(currentPlayinfo), selectedVideo, selectedAudio].filter(Boolean);
+      return listed(playinfo).some((item) => {
+        const deadline = deadlineOf(item);
+        return deadline > 0 && known.some((other) => sameRepresentation(other, item) && deadline < deadlineOf(other));
+      });
+    }
+
     function refreshRepresentationUrls(target, source) {
       if (!target || !source || target === source) return;
+      // Bilibili's page and the timed refresh both bring addresses, and the answer that
+      // arrives last is not always the newer one.
+      if (deadlineOf(source) < deadlineOf(target)) return;
       for (const key of ["baseUrl", "base_url", "backupUrl", "backup_url", "backup_url_list"]) {
         if (source[key] !== undefined) target[key] = source[key];
       }
@@ -2169,11 +2350,9 @@ const chrome = (() => {
     // epoch. 0 when no address carries a deadline.
     function urlDeadlineSeconds() {
       let earliest = 0;
-      for (const representation of [selectedVideo, selection.audio]) {
-        try {
-          const deadline = Number(new URL(representationUrl(representation)).searchParams.get("deadline")) || 0;
-          if (deadline > 0 && (!earliest || deadline < earliest)) earliest = deadline;
-        } catch (_error) {}
+      for (const representation of [selectedVideo, selectedAudio]) {
+        const deadline = deadlineOf(representation);
+        if (deadline > 0 && (!earliest || deadline < earliest)) earliest = deadline;
       }
       return earliest;
     }
@@ -2181,14 +2360,19 @@ const chrome = (() => {
     async function updatePlayinfo(playinfo) {
       if (destroyed) return;
       const next = selectRepresentations(playinfo, preferredQuality, preferredCodec);
+      // Bilibili's page and the timed refresh both bring playinfos, and the one that arrives
+      // last is not always the newer one. An older one is dropped whole: kept as the current
+      // playinfo it would hand its addresses to the next session, after a seek or a quality
+      // change, although the running session was protected from them. Every file the two
+      // name in common counts, not only the quality that is playing.
+      if (playinfo !== currentPlayinfo && namesOlderAddresses(playinfo)) return;
       currentPlayinfo = playinfo;
       const nextVideo = next.preferred;
-      const previousAudio = selection.audio;
-      const audioChanged = !sameRepresentation(previousAudio, next.audio);
+      const audioChanged = !sameRepresentation(selectedAudio, next.audio);
       selection = next;
       if (!audioChanged && sameRepresentation(selectedVideo, nextVideo)) {
         refreshRepresentationUrls(selectedVideo, nextVideo);
-        refreshRepresentationUrls(previousAudio, next.audio);
+        refreshRepresentationUrls(selectedAudio, next.audio);
         return;
       }
       await startSession(nextVideo, playbackState());
@@ -3828,8 +4012,30 @@ const chrome = (() => {
   const routeCids = new Map();
   const bootRouteKey = routeIdentity()?.key || "";
 
+  // Every file a playinfo names, with the time its signed address expires (seconds since the
+  // epoch, 0 if unknown).
+  function playinfoAddresses(playinfo) {
+    const dash = (playinfo?.data || playinfo)?.dash;
+    return [...(dash?.video || []), ...(dash?.audio || [])].map((item) => {
+      try {
+        const url = new URL(item.baseUrl || item.base_url);
+        return { key: `${item.id}|${item.codecid ?? item.codecs ?? ""}|${url.pathname}`, deadline: Number(url.searchParams.get("deadline")) || 0 };
+      } catch (_error) { return null; }
+    }).filter(Boolean);
+  }
+
+  // Whether a playinfo names, for any file the cached one knows, an address that expires sooner.
+  function namesOlderAddresses(playinfo, cached) {
+    const known = new Map(playinfoAddresses(cached).map((item) => [item.key, item.deadline]));
+    return playinfoAddresses(playinfo).some((item) => item.deadline > 0 && item.deadline < (known.get(item.key) || 0));
+  }
+
   function cachePlayinfo(identity, playinfo, cid = 0) {
     if (!identity || !isDashPlayinfo(playinfo)) return false;
+    // A late answer must not replace addresses that are good for longer: the cached playinfo
+    // is what the next takeover of this video starts from.
+    const cached = routePlayinfo.get(identity.key);
+    if (cached && cached !== playinfo && namesOlderAddresses(playinfo, cached)) return true;
     routePlayinfo.delete(identity.key);
     routePlayinfo.set(identity.key, playinfo);
     if (Number(cid) > 0) routeCids.set(identity.key, Number(cid));
@@ -3967,45 +4173,77 @@ const chrome = (() => {
   // Bilibili's signed download addresses expire (their deadline parameter). A long pause
   // used to run into that: every node answers 403 at once, a ban round starts and the video
   // stalls. New addresses are requested shortly before the old ones expire instead.
-  let deadlineRefresh = { route: "", deadline: 0, at: 0 };
+  // One request at a time, given up after fifteen seconds and dropped when the video changes.
+  // A failed attempt, or an answer whose addresses expire no later, waits longer each time.
+  let deadlineRefresh = { route: "", at: 0, failures: 0, controller: null };
+  function cancelDeadlineRefresh() {
+    deadlineRefresh.controller?.abort(new DOMException("视频已经换了", "AbortError"));
+    deadlineRefresh = { route: "", at: 0, failures: 0, controller: null };
+  }
   async function refreshExpiringPlayinfo() {
     if (!player || !playerRoute || typeof player.urlDeadlineSeconds !== "function") return;
     const identity = routeIdentity();
     if (!identity || identity.key !== playerRoute) return;
+    if (deadlineRefresh.route !== playerRoute) {
+      cancelDeadlineRefresh();
+      deadlineRefresh.route = playerRoute;
+    }
+    if (deadlineRefresh.controller) return;
     const deadline = player.urlDeadlineSeconds() || 0;
     if (!deadline || Date.now() / 1000 < deadline - 120) return;
     const now = Date.now();
-    if (deadlineRefresh.route === playerRoute && now - deadlineRefresh.at < 45000) return;
-    deadlineRefresh = { route: playerRoute, deadline, at: now };
+    if (now - deadlineRefresh.at < Math.min(300000, 45000 * (2 ** Math.min(deadlineRefresh.failures, 3)))) return;
+    const state = deadlineRefresh;
     const route = playerRoute;
     const lifecycle = playerLifecycle;
+    const current = player;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(new DOMException("B 站 15 秒内没有回应", "TimeoutError")), 15000);
+    state.at = now;
+    state.controller = controller;
+    const stale = () => state !== deadlineRefresh || lifecycle !== playerLifecycle || player !== current || playerRoute !== route || routeIdentity()?.key !== route;
     notices?.log("下载地址快要过期了", "正在向 B 站请求新的下载地址，播放不受影响。", "info", "", route, "download");
     try {
-      const playinfo = await fetchRoutePlayinfo(identity, null);
-      if (lifecycle !== playerLifecycle || playerRoute !== route || routeIdentity()?.key !== route) return;
-      await player.updatePlayinfo?.(playinfo);
+      const playinfo = await fetchRoutePlayinfo(identity, controller.signal, true);
+      if (stale()) return;
+      await current.updatePlayinfo?.(playinfo);
+      if (stale()) return;
+      // The same deadline again would otherwise be asked for every 45 seconds.
+      state.failures = (current.urlDeadlineSeconds() || 0) > deadline ? 0 : state.failures + 1;
     } catch (error) {
+      if (stale()) return;
+      state.failures += 1;
       notices?.log("没能提前换新下载地址", `${String(error?.message || error).slice(0, 120)}\n播放继续使用现在的地址，稍后再试。`, "info", "", route, "download");
+    } finally {
+      clearTimeout(timer);
+      if (state.controller === controller) state.controller = null;
     }
   }
 
-  async function fetchRoutePlayinfo(identity, signal) {
-    notices?.log("正在读取视频信息", "确认你要看的视频和分 P。", "info", "", identity.key, "takeover");
-    const query = identity.bvid
-      ? `bvid=${encodeURIComponent(identity.bvid)}`
-      : `aid=${encodeURIComponent(identity.aid)}`;
-    const viewResponse = await nativeFetch(`${BILIBILI_API_ORIGIN}/x/web-interface/view?${query}`, { credentials: "include", signal });
-    if (!viewResponse.ok) throw new Error(`读取视频信息失败（HTTP ${viewResponse.status}）`);
-    const viewPayload = await viewResponse.json();
-    if (Number(viewPayload?.code) !== 0 || !viewPayload?.data) throw new Error(viewPayload?.message || "读取视频信息失败");
-    const pages = Array.isArray(viewPayload.data.pages) ? viewPayload.data.pages : [];
-    const page = pages[identity.part - 1] || pages[0];
-    const cid = Number(page?.cid || viewPayload.data.cid) || 0;
-    if (!cid) throw new Error("新视频缺少 CID");
-    if (signal?.aborted) throw signal.reason || new DOMException("播放清单请求已取消", "AbortError");
-    routeCids.set(identity.key, cid);
-    const canonicalBvid = String(viewPayload.data.bvid || identity.bvid || "");
-    const canonicalAid = Number(viewPayload.data.aid || identity.aid) || 0;
+  // refresh: new addresses for the video that is already playing. Its CID is known by then,
+  // so the video information is not asked for again, and the takeover notices stay quiet.
+  async function fetchRoutePlayinfo(identity, signal, refresh = false) {
+    let cid = refresh ? Number(routeCids.get(identity.key)) || 0 : 0;
+    let canonicalBvid = String(identity.bvid || "");
+    let canonicalAid = Number(identity.aid) || 0;
+    if (!cid) {
+      if (!refresh) notices?.log("正在读取视频信息", "确认你要看的视频和分 P。", "info", "", identity.key, "takeover");
+      const query = identity.bvid
+        ? `bvid=${encodeURIComponent(identity.bvid)}`
+        : `aid=${encodeURIComponent(identity.aid)}`;
+      const viewResponse = await nativeFetch(`${BILIBILI_API_ORIGIN}/x/web-interface/view?${query}`, { credentials: "include", signal });
+      if (!viewResponse.ok) throw new Error(`读取视频信息失败（HTTP ${viewResponse.status}）`);
+      const viewPayload = await viewResponse.json();
+      if (Number(viewPayload?.code) !== 0 || !viewPayload?.data) throw new Error(viewPayload?.message || "读取视频信息失败");
+      const pages = Array.isArray(viewPayload.data.pages) ? viewPayload.data.pages : [];
+      const page = pages[identity.part - 1] || pages[0];
+      cid = Number(page?.cid || viewPayload.data.cid) || 0;
+      if (!cid) throw new Error("新视频缺少 CID");
+      if (signal?.aborted) throw signal.reason || new DOMException("播放清单请求已取消", "AbortError");
+      routeCids.set(identity.key, cid);
+      canonicalBvid = String(viewPayload.data.bvid || identity.bvid || "");
+      canonicalAid = Number(viewPayload.data.aid || identity.aid) || 0;
+    }
     const playQuery = canonicalBvid
       ? `bvid=${encodeURIComponent(canonicalBvid)}`
       : `avid=${encodeURIComponent(canonicalAid)}`;
@@ -4018,7 +4256,7 @@ const chrome = (() => {
     if (Number(playinfo?.code) !== 0 || !isDashPlayinfo(playinfo)) throw new Error(playinfo?.message || "新视频没有 DASH 播放清单");
     if (signal?.aborted) throw signal.reason || new DOMException("播放清单请求已取消", "AbortError");
     cachePlayinfo(identity, playinfo, cid);
-    notices?.log("已经拿到视频下载地址", "接下来开始准备多线程下载。", "success", "", identity.key, "takeover");
+    if (!refresh) notices?.log("已经拿到视频下载地址", "接下来开始准备多线程下载。", "success", "", identity.key, "takeover");
     return playinfo;
   }
 
@@ -4191,6 +4429,7 @@ const chrome = (() => {
     if (current) resumeHint = { playing: Boolean(current.wantsToPlay ? current.wantsToPlay() : current.video && !current.video.paused), at: Date.now(), handedBack: resumeNative };
     notices?.detach(resumeNative ? "已停止加速，交回 B 站原来的连接" : "已停止接管上一个视频");
     playerLifecycle += 1;
+    cancelDeadlineRefresh();
     player = null;
     playerRoute = "";
     playerContainer = null;

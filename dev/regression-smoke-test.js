@@ -18,11 +18,13 @@ const { chromium } = require("playwright");
     ["autoplay-choice-test.html", "autoplay-choice-result"],
     ["codec-choice-test.html", "codec-choice-result"],
     ["takeover-mode-test.html", "takeover-mode-result"],
-    ["quota-refresh-test.html", "quota-refresh-result"]
+    // Several scenarios that wait for buffer checks and rebuffering, hence the longer limit.
+    ["quota-refresh-test.html", "quota-refresh-result", 90000],
+    ["address-refresh-test.html", "address-refresh-result", 40000]
   ];
   try {
     for (let offset = 0; offset < tests.length; offset += 3) {
-      const results = await Promise.allSettled(tests.slice(offset, offset + 3).map(async ([file, id]) => {
+      const results = await Promise.allSettled(tests.slice(offset, offset + 3).map(async ([file, id, timeout = 20000]) => {
         const context = await browser.newContext();
         const page = await context.newPage();
         const errors = [];
@@ -35,7 +37,7 @@ const { chromium } = require("playwright");
         }
         try {
           await page.goto(`http://127.0.0.1:18763/dev/${file}`);
-          await page.waitForFunction(id => document.getElementById(id)?.dataset.pass === "true", id, { timeout: 20000 });
+          await page.waitForFunction(id => document.getElementById(id)?.dataset.pass === "true", id, { timeout });
           // The navigation fixtures emit early snapshots: wait past stale callbacks.
           await page.waitForTimeout(1200);
           const result = JSON.parse(await page.locator(`#${id}`).innerText());

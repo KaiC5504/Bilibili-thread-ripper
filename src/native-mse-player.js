@@ -11,6 +11,12 @@
   const STARTUP_BUFFER_MAX_SECONDS = 10;
   const STARTUP_RECOVERY_SECONDS = 6;
   const STARTUP_PROTECTION_MS = 20000;
+  // When the browser's buffer quota is hit: the forward buffer is never brought below the
+  // floor, and a full buffer with less than this ahead is a failure, not something to wait out.
+  const QUOTA_AHEAD_FLOOR_SECONDS = 8;
+  const QUOTA_FATAL_AHEAD_SECONDS = 10;
+  // A video whose buffer stays full through this many waits is given up after all.
+  const QUOTA_MAX_WAITS = 8;
   const QUALITY_NAMES = Object.freeze({
     127: "8K", 126: "杜比视界", 125: "HDR", 120: "4K", 116: "1080P 60帧",
     112: "1080P 高码率", 80: "1080P", 74: "720P 60帧", 64: "720P",
@@ -199,6 +205,10 @@
     let preferredCodec = normalizeCodec(options.preferredCodec);
     let selection = selectRepresentations(currentPlayinfo, preferredQuality, preferredCodec);
     let selectedVideo = selection.preferred;
+    // The two representation objects the running session downloads from. Its resolvers keep
+    // reading them, so fresh addresses always go into these two and never into a newer
+    // selection's copies.
+    let selectedAudio = selection.audio;
     let sessionStarts = 0;
     let session = null;
     let destroyed = false;
@@ -296,7 +306,7 @@
           if (error?.name !== "QuotaExceededError") throw error;
           const current = Number(video.currentTime) || 0;
           const ahead = Math.max(0, bufferedEndAt(track.sourceBuffer, current) - current);
-          candidate.bufferAheadLimit = Math.max(15, Math.min(candidate.bufferAheadLimit || Infinity, ahead * 0.75));
+          candidate.bufferAheadLimit = Math.max(QUOTA_AHEAD_FLOOR_SECONDS, Math.min(candidate.bufferAheadLimit || Infinity, ahead * 0.75));
           note("buffer quota hit", `${track.kind} keeps ${candidate.bufferAheadLimit.toFixed(0)}s ahead`);
           options.onLog?.("浏览器缓冲区满了", `已释放播放过的数据，这个视频接下来最多提前缓冲 ${candidate.bufferAheadLimit.toFixed(0)} 秒。`, "info", "buffer");
           const behindEnd = Math.max(0, current - 5);
@@ -305,7 +315,15 @@
             await waitEvent(track.sourceBuffer, "updateend", "error", candidate.controller.signal);
           }
           if (!sessionIsCurrent(candidate) || generation !== candidate.generation) return;
-          track.sourceBuffer.appendBuffer(bytes);
+          try {
+            track.sourceBuffer.appendBuffer(bytes);
+          } catch (again) {
+            if (again?.name !== "QuotaExceededError") throw again;
+            // Nothing played is left to free: what is buffered ahead fills the quota by
+            // itself. This write ends here so the buffer's queue stays free; the caller
+            // keeps the bytes and writes them once playback has used up some of the buffer.
+            throw Object.assign(again, { bufferFull: true, aheadSeconds: ahead });
+          }
         }
         await waitEvent(track.sourceBuffer, "updateend", "error", candidate.controller.signal);
       });
@@ -403,10 +421,16 @@
       ensureBuffer(candidate);
     }
 
-    // How far ahead this session may buffer: the setting, brought down when the
+    // How far ahead this session may buffer: the setting, brought down each time the
     // browser's own buffer quota was hit.
     function aheadTarget(candidate) {
       return Math.min(core.normalizeSettings(getSettings()).bufferAheadSeconds, candidate.bufferAheadLimit || Infinity);
+    }
+
+    // The buffer a start or a recovery waits for must be one the tracks can still reach: with
+    // the limit brought down to eight seconds, waiting for ten would never end.
+    function reachableSeconds(candidate, seconds) {
+      return Math.min(seconds, Math.max(0.5, aheadTarget(candidate) - 2));
     }
 
     async function fillTrack(candidate, track) {
@@ -431,7 +455,7 @@
             const segment = track.sidx.segments[index];
             if (!segment || projectedEnd - current >= aheadTarget(candidate)) break;
             projectedEnd = segment.endTime;
-            if (track.prefetches.has(index)) continue;
+            if (track.prefetches.has(index) || track.held?.index === index) continue;
             const startup = !track.startupComplete && index === track.startupIndex;
             track.prefetches.set(index, segmentDownload(candidate, track, segment, index, {
               priority: startup ? 120 : Math.max(30, 55 - offset * 5),
@@ -443,6 +467,9 @@
                 track.startupScheduled = true;
                 maybeStartStartupPrefetch(candidate);
               } : null,
+              // The first segment is written piece by piece as it arrives. A full buffer here,
+              // with next to nothing buffered yet, ends the download and the takeover as it
+              // always did; only whole segments further on are kept and written later.
               onOrderedChunk: startup ? async (bytes) => {
                 if (!sessionIsCurrent(candidate) || generation !== candidate.generation || signal.aborted) return;
                 candidate.progressiveAppends += 1;
@@ -451,13 +478,28 @@
               } : null
             }));
           }
-          const pending = track.prefetches.get(track.nextIndex);
-          if (!pending) break;
-          const settled = await pending;
-          track.prefetches.delete(settled.index);
+          // A segment the buffer had no room for comes first. The check at the top of this
+          // loop let it through, so playback has used up a quarter of what was buffered since.
+          const pending = track.held ? null : track.prefetches.get(track.nextIndex);
+          if (!track.held && !pending) break;
+          const settled = track.held || await pending;
+          if (!track.held) track.prefetches.delete(settled.index);
           if (settled.error) throw settled.error;
           if (!sessionIsCurrent(candidate) || generation !== candidate.generation || signal.aborted) break;
-          if (!settled.result.streamed) await append(candidate, track, settled.result.bytes, generation);
+          if (!settled.result.streamed) {
+            try {
+              await append(candidate, track, settled.result.bytes, generation);
+              track.held = null;
+            } catch (error) {
+              // With this little buffered there is nothing left to give up, and waiting
+              // would only stall the video: that stays a failure, as it always was.
+              if (!error?.bufferFull || error.aheadSeconds < QUOTA_FATAL_AHEAD_SECONDS) throw error;
+              candidate.quotaWaits += 1;
+              if (candidate.quotaWaits > QUOTA_MAX_WAITS) throw error;
+              track.held = settled;
+              break;
+            }
+          }
           if (!track.startupComplete && settled.index === track.startupIndex) {
             note("first segment in", `${track.kind} ${Math.round(settled.result.byteLength / 1024)} KiB in ${settled.result.pieceCount} pieces`);
             track.startupComplete = true;
@@ -547,7 +589,7 @@
       candidate.startTime = target;
       if (!candidate.tracks.every((track) => isBufferedAt(track.sourceBuffer, target))) return;
       const ends = candidate.tracks.map((track) => bufferedEndAt(track.sourceBuffer, target));
-      const required = updateStartupProfile(candidate);
+      const required = reachableSeconds(candidate, updateStartupProfile(candidate));
       const remaining = Math.max(0.5, (Number(candidate.mediaSource.duration) || target + required) - target);
       if (Math.min(...ends) - target < Math.max(0.5, Math.min(required, remaining))) return;
       candidate.playbackActivated = true;
@@ -578,7 +620,7 @@
       const ahead = ready ? Math.max(0, Math.min(...candidate.tracks.map((track) => bufferedEndAt(track.sourceBuffer, current))) - current) : 0;
       if (candidate.recovering && ready) {
         const remaining = Math.max(0.5, (Number(candidate.mediaSource.duration) || current + candidate.recoveryTargetSeconds) - current);
-        if (ahead >= Math.min(candidate.recoveryTargetSeconds, remaining)) {
+        if (ahead >= Math.min(reachableSeconds(candidate, candidate.recoveryTargetSeconds), remaining)) {
           candidate.recovering = false;
           options.onLog?.("缓冲补好了，可以继续播放", `已经备好接下来 ${ahead.toFixed(1)} 秒的数据。`, "success", "buffer");
           candidate.playAttempted = false;
@@ -627,7 +669,10 @@
       if (destroyed) return;
       options.onLog?.("正在准备播放器", `使用 ${qualityLabel(representation)} 清晰度，从 ${Number(playbackState.time || 0).toFixed(2)} 秒开始。`, "info", "takeover");
       const previous = session;
+      // Read once: selection can be replaced by a new playinfo while this session starts.
+      const audio = selection.audio;
       selectedVideo = representation;
+      selectedAudio = audio;
       sessionStarts += 1;
       note("session", `${qualityLabel(representation)} ${codecFamily(representation)} from ${Number(playbackState.time || 0).toFixed(1)}`);
       const mediaSource = new MediaSource();
@@ -637,7 +682,7 @@
         controller: new AbortController(), mediaSource, objectUrl,
         timer: null, endRetryTimer: null, tracks: [], ending: false, streamEnded: false,
         playAttempted: false, playbackActivated: false, playbackActivatedAt: 0,
-        recovering: false, recoveryTargetSeconds: STARTUP_RECOVERY_SECONDS, bufferAheadLimit: 0,
+        recovering: false, recoveryTargetSeconds: STARTUP_RECOVERY_SECONDS, bufferAheadLimit: 0, quotaWaits: 0,
         startupCompletedBytes: 0, startupPrefetchLaunched: false, startupStartedAt: performance.now(),
         progressiveAppends: 0,
         startupTargetSeconds: 6, startupThroughputBps: 0, mediaBytesPerSecond: 0,
@@ -648,7 +693,7 @@
         internalSeekTarget: null,
         // One ban list per video, shared by every quality and by the audio track.
         videoResolver: resolverFactory.createResolver(representation, () => core.normalizeSettings(getSettings()).mode, options.cdnBans, () => core.normalizeSettings(getSettings()).customHosts),
-        audioResolver: resolverFactory.createResolver(selection.audio, () => core.normalizeSettings(getSettings()).mode, options.cdnBans, () => core.normalizeSettings(getSettings()).customHosts)
+        audioResolver: resolverFactory.createResolver(audio, () => core.normalizeSettings(getSettings()).mode, options.cdnBans, () => core.normalizeSettings(getSettings()).customHosts)
       };
       session = candidate;
       if (previous) disposeSession(previous, false);
@@ -665,10 +710,10 @@
         if (mediaSource.readyState !== "open") await waitEvent(mediaSource, "sourceopen", "error", candidate.controller.signal);
         if (!sessionIsCurrent(candidate)) return;
         const videoBuffer = mediaSource.addSourceBuffer(mimeFor(representation, "video"));
-        const audioBuffer = mediaSource.addSourceBuffer(mimeFor(selection.audio, "audio"));
+        const audioBuffer = mediaSource.addSourceBuffer(mimeFor(audio, "audio"));
         const [videoTrack, audioTrack] = await Promise.all([
           loadTrack(candidate, "video", representation, candidate.videoResolver, videoBuffer, candidate.startTime),
-          loadTrack(candidate, "audio", selection.audio, candidate.audioResolver, audioBuffer, candidate.startTime)
+          loadTrack(candidate, "audio", audio, candidate.audioResolver, audioBuffer, candidate.startTime)
         ]);
         if (!sessionIsCurrent(candidate)) return;
         candidate.tracks = [videoTrack, audioTrack];
@@ -784,8 +829,29 @@
     // A refreshed playinfo names the same files with fresh signatures. The resolvers of a
     // running session keep reading their representation objects, so those objects receive
     // the new addresses; nothing else about the session changes.
+    function deadlineOf(representation) {
+      try { return Number(new URL(representationUrl(representation)).searchParams.get("deadline")) || 0; }
+      catch (_error) { return 0; }
+    }
+
+    // Whether a playinfo names, for any file already known, an address that expires sooner.
+    function namesOlderAddresses(playinfo) {
+      const listed = (item) => {
+        const dash = dashBody(item)?.dash;
+        return [...(dash?.video || []), ...(dash?.audio || [])];
+      };
+      const known = [...listed(currentPlayinfo), selectedVideo, selectedAudio].filter(Boolean);
+      return listed(playinfo).some((item) => {
+        const deadline = deadlineOf(item);
+        return deadline > 0 && known.some((other) => sameRepresentation(other, item) && deadline < deadlineOf(other));
+      });
+    }
+
     function refreshRepresentationUrls(target, source) {
       if (!target || !source || target === source) return;
+      // Bilibili's page and the timed refresh both bring addresses, and the answer that
+      // arrives last is not always the newer one.
+      if (deadlineOf(source) < deadlineOf(target)) return;
       for (const key of ["baseUrl", "base_url", "backupUrl", "backup_url", "backup_url_list"]) {
         if (source[key] !== undefined) target[key] = source[key];
       }
@@ -795,11 +861,9 @@
     // epoch. 0 when no address carries a deadline.
     function urlDeadlineSeconds() {
       let earliest = 0;
-      for (const representation of [selectedVideo, selection.audio]) {
-        try {
-          const deadline = Number(new URL(representationUrl(representation)).searchParams.get("deadline")) || 0;
-          if (deadline > 0 && (!earliest || deadline < earliest)) earliest = deadline;
-        } catch (_error) {}
+      for (const representation of [selectedVideo, selectedAudio]) {
+        const deadline = deadlineOf(representation);
+        if (deadline > 0 && (!earliest || deadline < earliest)) earliest = deadline;
       }
       return earliest;
     }
@@ -807,14 +871,19 @@
     async function updatePlayinfo(playinfo) {
       if (destroyed) return;
       const next = selectRepresentations(playinfo, preferredQuality, preferredCodec);
+      // Bilibili's page and the timed refresh both bring playinfos, and the one that arrives
+      // last is not always the newer one. An older one is dropped whole: kept as the current
+      // playinfo it would hand its addresses to the next session, after a seek or a quality
+      // change, although the running session was protected from them. Every file the two
+      // name in common counts, not only the quality that is playing.
+      if (playinfo !== currentPlayinfo && namesOlderAddresses(playinfo)) return;
       currentPlayinfo = playinfo;
       const nextVideo = next.preferred;
-      const previousAudio = selection.audio;
-      const audioChanged = !sameRepresentation(previousAudio, next.audio);
+      const audioChanged = !sameRepresentation(selectedAudio, next.audio);
       selection = next;
       if (!audioChanged && sameRepresentation(selectedVideo, nextVideo)) {
         refreshRepresentationUrls(selectedVideo, nextVideo);
-        refreshRepresentationUrls(previousAudio, next.audio);
+        refreshRepresentationUrls(selectedAudio, next.audio);
         return;
       }
       await startSession(nextVideo, playbackState());

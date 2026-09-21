@@ -363,8 +363,30 @@
   const routeCids = new Map();
   const bootRouteKey = routeIdentity()?.key || "";
 
+  // Every file a playinfo names, with the time its signed address expires (seconds since the
+  // epoch, 0 if unknown).
+  function playinfoAddresses(playinfo) {
+    const dash = (playinfo?.data || playinfo)?.dash;
+    return [...(dash?.video || []), ...(dash?.audio || [])].map((item) => {
+      try {
+        const url = new URL(item.baseUrl || item.base_url);
+        return { key: `${item.id}|${item.codecid ?? item.codecs ?? ""}|${url.pathname}`, deadline: Number(url.searchParams.get("deadline")) || 0 };
+      } catch (_error) { return null; }
+    }).filter(Boolean);
+  }
+
+  // Whether a playinfo names, for any file the cached one knows, an address that expires sooner.
+  function namesOlderAddresses(playinfo, cached) {
+    const known = new Map(playinfoAddresses(cached).map((item) => [item.key, item.deadline]));
+    return playinfoAddresses(playinfo).some((item) => item.deadline > 0 && item.deadline < (known.get(item.key) || 0));
+  }
+
   function cachePlayinfo(identity, playinfo, cid = 0) {
     if (!identity || !isDashPlayinfo(playinfo)) return false;
+    // A late answer must not replace addresses that are good for longer: the cached playinfo
+    // is what the next takeover of this video starts from.
+    const cached = routePlayinfo.get(identity.key);
+    if (cached && cached !== playinfo && namesOlderAddresses(playinfo, cached)) return true;
     routePlayinfo.delete(identity.key);
     routePlayinfo.set(identity.key, playinfo);
     if (Number(cid) > 0) routeCids.set(identity.key, Number(cid));
@@ -502,45 +524,77 @@
   // Bilibili's signed download addresses expire (their deadline parameter). A long pause
   // used to run into that: every node answers 403 at once, a ban round starts and the video
   // stalls. New addresses are requested shortly before the old ones expire instead.
-  let deadlineRefresh = { route: "", deadline: 0, at: 0 };
+  // One request at a time, given up after fifteen seconds and dropped when the video changes.
+  // A failed attempt, or an answer whose addresses expire no later, waits longer each time.
+  let deadlineRefresh = { route: "", at: 0, failures: 0, controller: null };
+  function cancelDeadlineRefresh() {
+    deadlineRefresh.controller?.abort(new DOMException("视频已经换了", "AbortError"));
+    deadlineRefresh = { route: "", at: 0, failures: 0, controller: null };
+  }
   async function refreshExpiringPlayinfo() {
     if (!player || !playerRoute || typeof player.urlDeadlineSeconds !== "function") return;
     const identity = routeIdentity();
     if (!identity || identity.key !== playerRoute) return;
+    if (deadlineRefresh.route !== playerRoute) {
+      cancelDeadlineRefresh();
+      deadlineRefresh.route = playerRoute;
+    }
+    if (deadlineRefresh.controller) return;
     const deadline = player.urlDeadlineSeconds() || 0;
     if (!deadline || Date.now() / 1000 < deadline - 120) return;
     const now = Date.now();
-    if (deadlineRefresh.route === playerRoute && now - deadlineRefresh.at < 45000) return;
-    deadlineRefresh = { route: playerRoute, deadline, at: now };
+    if (now - deadlineRefresh.at < Math.min(300000, 45000 * (2 ** Math.min(deadlineRefresh.failures, 3)))) return;
+    const state = deadlineRefresh;
     const route = playerRoute;
     const lifecycle = playerLifecycle;
+    const current = player;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(new DOMException("B 站 15 秒内没有回应", "TimeoutError")), 15000);
+    state.at = now;
+    state.controller = controller;
+    const stale = () => state !== deadlineRefresh || lifecycle !== playerLifecycle || player !== current || playerRoute !== route || routeIdentity()?.key !== route;
     notices?.log("下载地址快要过期了", "正在向 B 站请求新的下载地址，播放不受影响。", "info", "", route, "download");
     try {
-      const playinfo = await fetchRoutePlayinfo(identity, null);
-      if (lifecycle !== playerLifecycle || playerRoute !== route || routeIdentity()?.key !== route) return;
-      await player.updatePlayinfo?.(playinfo);
+      const playinfo = await fetchRoutePlayinfo(identity, controller.signal, true);
+      if (stale()) return;
+      await current.updatePlayinfo?.(playinfo);
+      if (stale()) return;
+      // The same deadline again would otherwise be asked for every 45 seconds.
+      state.failures = (current.urlDeadlineSeconds() || 0) > deadline ? 0 : state.failures + 1;
     } catch (error) {
+      if (stale()) return;
+      state.failures += 1;
       notices?.log("没能提前换新下载地址", `${String(error?.message || error).slice(0, 120)}\n播放继续使用现在的地址，稍后再试。`, "info", "", route, "download");
+    } finally {
+      clearTimeout(timer);
+      if (state.controller === controller) state.controller = null;
     }
   }
 
-  async function fetchRoutePlayinfo(identity, signal) {
-    notices?.log("正在读取视频信息", "确认你要看的视频和分 P。", "info", "", identity.key, "takeover");
-    const query = identity.bvid
-      ? `bvid=${encodeURIComponent(identity.bvid)}`
-      : `aid=${encodeURIComponent(identity.aid)}`;
-    const viewResponse = await nativeFetch(`${BILIBILI_API_ORIGIN}/x/web-interface/view?${query}`, { credentials: "include", signal });
-    if (!viewResponse.ok) throw new Error(`读取视频信息失败（HTTP ${viewResponse.status}）`);
-    const viewPayload = await viewResponse.json();
-    if (Number(viewPayload?.code) !== 0 || !viewPayload?.data) throw new Error(viewPayload?.message || "读取视频信息失败");
-    const pages = Array.isArray(viewPayload.data.pages) ? viewPayload.data.pages : [];
-    const page = pages[identity.part - 1] || pages[0];
-    const cid = Number(page?.cid || viewPayload.data.cid) || 0;
-    if (!cid) throw new Error("新视频缺少 CID");
-    if (signal?.aborted) throw signal.reason || new DOMException("播放清单请求已取消", "AbortError");
-    routeCids.set(identity.key, cid);
-    const canonicalBvid = String(viewPayload.data.bvid || identity.bvid || "");
-    const canonicalAid = Number(viewPayload.data.aid || identity.aid) || 0;
+  // refresh: new addresses for the video that is already playing. Its CID is known by then,
+  // so the video information is not asked for again, and the takeover notices stay quiet.
+  async function fetchRoutePlayinfo(identity, signal, refresh = false) {
+    let cid = refresh ? Number(routeCids.get(identity.key)) || 0 : 0;
+    let canonicalBvid = String(identity.bvid || "");
+    let canonicalAid = Number(identity.aid) || 0;
+    if (!cid) {
+      if (!refresh) notices?.log("正在读取视频信息", "确认你要看的视频和分 P。", "info", "", identity.key, "takeover");
+      const query = identity.bvid
+        ? `bvid=${encodeURIComponent(identity.bvid)}`
+        : `aid=${encodeURIComponent(identity.aid)}`;
+      const viewResponse = await nativeFetch(`${BILIBILI_API_ORIGIN}/x/web-interface/view?${query}`, { credentials: "include", signal });
+      if (!viewResponse.ok) throw new Error(`读取视频信息失败（HTTP ${viewResponse.status}）`);
+      const viewPayload = await viewResponse.json();
+      if (Number(viewPayload?.code) !== 0 || !viewPayload?.data) throw new Error(viewPayload?.message || "读取视频信息失败");
+      const pages = Array.isArray(viewPayload.data.pages) ? viewPayload.data.pages : [];
+      const page = pages[identity.part - 1] || pages[0];
+      cid = Number(page?.cid || viewPayload.data.cid) || 0;
+      if (!cid) throw new Error("新视频缺少 CID");
+      if (signal?.aborted) throw signal.reason || new DOMException("播放清单请求已取消", "AbortError");
+      routeCids.set(identity.key, cid);
+      canonicalBvid = String(viewPayload.data.bvid || identity.bvid || "");
+      canonicalAid = Number(viewPayload.data.aid || identity.aid) || 0;
+    }
     const playQuery = canonicalBvid
       ? `bvid=${encodeURIComponent(canonicalBvid)}`
       : `avid=${encodeURIComponent(canonicalAid)}`;
@@ -553,7 +607,7 @@
     if (Number(playinfo?.code) !== 0 || !isDashPlayinfo(playinfo)) throw new Error(playinfo?.message || "新视频没有 DASH 播放清单");
     if (signal?.aborted) throw signal.reason || new DOMException("播放清单请求已取消", "AbortError");
     cachePlayinfo(identity, playinfo, cid);
-    notices?.log("已经拿到视频下载地址", "接下来开始准备多线程下载。", "success", "", identity.key, "takeover");
+    if (!refresh) notices?.log("已经拿到视频下载地址", "接下来开始准备多线程下载。", "success", "", identity.key, "takeover");
     return playinfo;
   }
 
@@ -726,6 +780,7 @@
     if (current) resumeHint = { playing: Boolean(current.wantsToPlay ? current.wantsToPlay() : current.video && !current.video.paused), at: Date.now(), handedBack: resumeNative };
     notices?.detach(resumeNative ? "已停止加速，交回 B 站原来的连接" : "已停止接管上一个视频");
     playerLifecycle += 1;
+    cancelDeadlineRefresh();
     player = null;
     playerRoute = "";
     playerContainer = null;

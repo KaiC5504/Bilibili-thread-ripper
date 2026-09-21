@@ -177,8 +177,42 @@
     });
   }
 
+  // How long a measured speed counts. A node in use is measured again with every segment; one
+  // that was left out for being slow goes back to the untested ones after this, and gets
+  // another try through the exploration slot.
+  const MEASUREMENT_TTL_MS = 90000;
+
   function createResolver(representation, getMode, bans = null, getCustomHosts = null) {
     const health = new Map();
+    // What is known about a node's speed, per node and file, without the query. An address
+    // with a fresh signature is the same route, so it starts with what its predecessor
+    // measured. Failures are not kept here: those belong to the address they happened on.
+    const routes = new Map();
+    const routeKeys = new Map();
+    const routeOf = (url) => {
+      let key = routeKeys.get(url);
+      if (!key) {
+        try {
+          const parsed = new URL(url);
+          key = `${parsed.host}${parsed.pathname}`;
+        } catch (_error) { key = String(url); }
+        if (routeKeys.size > 512) routeKeys.clear();
+        routeKeys.set(url, key);
+      }
+      return key;
+    };
+    const measurement = (url) => routes.get(routeOf(url)) || null;
+    // Only a transfer long enough to measure a speed renews it. The short tail of a resumed
+    // piece proves the node works, and must not keep an old speed alive for ever.
+    const measuredNow = (url, now = Date.now()) => {
+      const item = measurement(url);
+      return Boolean(item?.lastMeasuredAt) && now - item.lastMeasuredAt < MEASUREMENT_TTL_MS;
+    };
+    const bySpeed = (a, b) => {
+      const am = measurement(a) || {};
+      const bm = measurement(b) || {};
+      return Number(Boolean(bm.lastSuccessAt)) - Number(Boolean(am.lastSuccessAt)) || (bm.bps || 0) - (am.bps || 0);
+    };
     let cursor = 0;
     let mediaRangeCount = 0;
     let rangeCursor = 0;
@@ -215,12 +249,7 @@
       const now = Date.now();
       const pool = urls()
         .filter((url) => (health.get(url)?.blockedUntil || 0) <= now)
-        .sort((a, b) => {
-          const ah = health.get(a) || {};
-          const bh = health.get(b) || {};
-          return Number(Boolean(bh.lastSuccessAt)) - Number(Boolean(ah.lastSuccessAt)) ||
-            (bh.bps || 0) - (ah.bps || 0);
-        });
+        .sort(bySpeed);
       if (!pool.length) return urls();
       const firstRange = mediaRangeCount === 0;
       const width = Math.min(firstRange ? pool.length : 6, pool.length);
@@ -231,12 +260,17 @@
         rangeCursor = width % pool.length;
       } else {
         // After the warm-up the measured nodes carry the segments in speed order; the
-        // downloader gives the fast ones the larger share. One untested node rides along
-        // per segment, so a route that has never answered still gets its chance.
-        const measured = pool.filter((url) => health.get(url)?.lastSuccessAt);
-        const rest = pool.filter((url) => !health.get(url)?.lastSuccessAt);
-        const explore = rest.length ? [rest[rangeCursor % rest.length]] : [];
-        rangeCursor = (rangeCursor + 1) % Math.max(1, pool.length);
+        // downloader gives the fast ones the larger share. One other node rides along per
+        // segment: one that never answered, or one whose measurement has gone stale because
+        // it was too slow to be used. Routes change, so a slow node is not slow for good.
+        // While fewer nodes are measured than a segment uses, the free places go to the others
+        // as well: the downloader gives an unmeasured node only a trial piece or two, so
+        // finding the good nodes quickly costs little.
+        const measured = pool.filter((url) => measuredNow(url, now));
+        const rest = pool.filter((url) => !measuredNow(url, now));
+        const places = Math.min(rest.length, Math.max(1, width - measured.length));
+        const explore = Array.from({ length: places }, (_item, index) => rest[(rangeCursor + index) % rest.length]);
+        rangeCursor = (rangeCursor + places) % Math.max(1, pool.length);
         selected = [...measured.slice(0, width - explore.length), ...explore];
         for (const url of pool) {
           if (selected.length >= Math.min(3, pool.length)) break;
@@ -266,21 +300,32 @@
       const now = Date.now();
       return urls()
         .filter((url) => (health.get(url)?.blockedUntil || 0) <= now)
-        .sort((a, b) => {
-          const ah = health.get(a) || {};
-          const bh = health.get(b) || {};
-          return Number(Boolean(bh.lastSuccessAt)) - Number(Boolean(ah.lastSuccessAt)) ||
-            (bh.bps || 0) - (ah.bps || 0);
-        });
+        .sort(bySpeed);
     }
 
     function success(url, bps) {
       bans?.success?.(url);
-      const old = health.get(url) || {};
-      health.set(url, {
-        failures: 0,
-        blockedUntil: 0,
-        lastSuccessAt: Date.now(),
+      const old = measurement(url) || {};
+      const now = Date.now();
+      const measured = bps > 0;
+      health.set(url, { failures: 0, blockedUntil: 0, lastSuccessAt: now });
+      routes.set(routeOf(url), {
+        lastSuccessAt: now,
+        // No speed comes with a transfer too short to measure one; the last one stays, and
+        // keeps its age.
+        lastMeasuredAt: measured ? now : old.lastMeasuredAt || 0,
+        bps: !measured ? old.bps || 0 : old.bps ? old.bps * 0.65 + bps * 0.35 : bps
+      });
+    }
+
+    // The speed of a transfer that was cut off before its end. It says how fast the node is
+    // and nothing more: the address has not proven itself, and earlier failures stay.
+    function sample(url, bps) {
+      if (!(bps > 0)) return;
+      const old = measurement(url) || {};
+      routes.set(routeOf(url), {
+        lastSuccessAt: old.lastSuccessAt || 0,
+        lastMeasuredAt: Date.now(),
         bps: old.bps ? old.bps * 0.65 + bps * 0.35 : bps
       });
     }
@@ -307,16 +352,17 @@
         const nodeBanned = bans && !(bans.allowsNode ? bans.allowsNode(url) : bans.allows(url));
         return {
           host: new URL(url).hostname,
-          state: nodeBanned ? "banned" : (item.blockedUntil || 0) > now ? "blocked" : item.lastSuccessAt ? "healthy" : "untested",
-          bps: item.bps || 0
+          state: nodeBanned ? "banned" : (item.blockedUntil || 0) > now ? "blocked" : measurement(url)?.lastSuccessAt ? "healthy" : "untested",
+          bps: measurement(url)?.bps || 0
         };
       });
     }
 
     const allows = (url) => !bans || bans.allows(url);
-    // The measured download speed of an address, for weighting piece assignments.
-    const speed = (url) => health.get(url)?.bps || 0;
-    return Object.freeze({ allows, failure, ordered, rangeCandidates, rescueCandidates, speed, startupCandidates, status, success, urls });
+    // The measured download speed of an address, for weighting piece assignments. 0 when
+    // there is none or it has gone stale.
+    const speed = (url) => (measuredNow(url) ? measurement(url)?.bps || 0 : 0);
+    return Object.freeze({ allows, failure, ordered, rangeCandidates, rescueCandidates, sample, speed, startupCandidates, status, success, urls });
   }
 
   root.__BILI_CDN_RESOLVER_FACTORY__ = Object.freeze({
