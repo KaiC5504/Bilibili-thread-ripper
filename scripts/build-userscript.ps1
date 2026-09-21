@@ -38,7 +38,6 @@ $header += @(
   "// @grant        unsafeWindow",
   "// @sandbox      JavaScript",
   "// @inject-into  content",
-  "// @noframes",
   "// ==/UserScript==",
   "",
   "// 这个文件由 scripts/build-userscript.ps1 生成，不要直接修改。"
@@ -46,6 +45,9 @@ $header += @(
 
 $body = New-Object System.Text.StringBuilder
 [void]$body.Append(($header -join "`n") + "`n(function () {`n`"use strict`";`n`nfunction pageCode() {`n`"use strict`";`n")
+# 直播间的播放器在 live.bilibili.com 的 iframe（/blanc/…）里，所以 iframe 也要注入；
+# 其他站内 iframe（评论、活动等）直接退出。
+[void]$body.Append("if (window.top !== window && !/^live\.bilibili\.com$/i.test(location.hostname)) return;`n")
 [void]$body.Append("if (document.documentElement?.hasAttribute(`"data-btr-userscript`")) return;`n")
 [void]$body.Append("document.documentElement?.setAttribute(`"data-btr-userscript`", `"`");`n")
 foreach ($file in $pageFiles) { Add-Source $body $file }

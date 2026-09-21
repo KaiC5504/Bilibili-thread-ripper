@@ -17,10 +17,13 @@ function checkFile() {
   assert.deepEqual(values("version"), [manifest.version]);
   assert.deepEqual(values("updateURL"), [scriptUrl]);
   assert.deepEqual(values("downloadURL"), [scriptUrl]);
-  assert.deepEqual(values("match"), ["https://www.bilibili.com/*", "https://m.bilibili.com/*"]);
+  assert.deepEqual(values("match"), ["https://www.bilibili.com/*", "https://m.bilibili.com/*", "https://live.bilibili.com/*"]);
   assert.deepEqual(values("run-at"), ["document-start"]);
   assert.deepEqual(values("grant").sort(), ["GM_addElement", "GM_registerMenuCommand", "unsafeWindow"]);
-  assert.match(header, /^\/\/ @noframes$/m);
+  // Live players sit in live.bilibili.com iframes, so the script must run in frames; the
+  // page code itself keeps other sites' iframes out.
+  assert.doesNotMatch(header, /^\/\/ @noframes$/m);
+  assert.match(script, /window\.top !== window && !\/\^live/);
   new vm.Script(script, { filename: "bilibili-thread-ripper.user.js" });
   // The extension's content scripts, settings panel included, are there unchanged and in
   // order; a file both script lists use appears once.

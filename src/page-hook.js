@@ -10,6 +10,9 @@
   const SETTINGS_ID = "__bilibili_thread_ripper_native_settings__";
   const SETTINGS_STYLE_ID = "__bilibili_thread_ripper_native_settings_style__";
   if (root[INSTALL_FLAG]) return;
+  // The live site has its own module (live-hook.js); the userscript build loads every
+  // file everywhere, so the video takeover keeps off that hostname.
+  if (/^live\.bilibili\.com$/i.test(root.location?.hostname || "")) return;
 
   const core = root.__BILI_RANGE_CORE__;
   const playerFactory = root.__BILI_NATIVE_MSE_PLAYER_FACTORY__;
@@ -62,7 +65,7 @@
   let transferSequence = 1;
   const transfers = new Map();
   const stats = {
-    version: "0.9.3.0",
+    version: "0.9.4.0",
     architecture: "bilibili-native-ui-progressive-mse-0.8-core",
     mode: settings.mode,
     playerState: "waiting",
@@ -856,9 +859,56 @@
     qualityPlayer = current;
     syncedQuality = wanted;
     notices?.log("跟随播放器切换清晰度", wanted ? `正在换成播放器选的清晰度（${wanted}）。` : "播放器改回了自动，使用这个视频默认的清晰度。", "info", "", route, "playback");
-    current.setQuality(wanted).catch((error) => {
+    current.setQuality(wanted).then(() => {
+      if (lifecycle === playerLifecycle && player === current) resolveNativeQualitySwitch();
+    }).catch((error) => {
       if (lifecycle === playerLifecycle && player === current) recordTakeoverFailure(route, "quality", error, true);
     });
+  }
+
+  // While BTR plays the video, Bilibili's core never receives its "new quality rendered"
+  // confirmation, and after about twenty seconds it shows 切换失败 and rolls the menu back,
+  // although the stream switched long ago. Once the takeover really plays the requested
+  // quality, the pending switch is resolved for it (its qnSwitchingInfo carries the
+  // resolver; verified against the live player, where resolve() settles the switch
+  // without disturbing getQuality()).
+  //
+  // The confirmation must also come quickly: while the switch is pending, the core's own
+  // leftover pipeline keeps running against its long-detached MediaSource, and can crash
+  // on a null SourceBuffer (reading 'updating'), which it reports as an immediate 切换失败.
+  // A pending switch therefore arms a short fast loop instead of waiting for the next
+  // one-second tick.
+  let resolvedSwitchToken = null;
+  let fastResolveTimer = null;
+  let fastResolveUntil = 0;
+  function resolveNativeQualitySwitch() {
+    if (!player || player.nativeTransport) return;
+    try {
+      const pending = root.player?.__core?.()?.qnSwitchingInfo?.video;
+      if (!pending?.switching || typeof pending.resolve !== "function" || resolvedSwitchToken === pending) return;
+      armFastResolve();
+      if (stats.playerState !== "ready") return;
+      const target = nativeQuality();
+      const playingId = Number(player.getDebug?.()?.qualityId) || 0;
+      if (target && playingId !== target) return;
+      resolvedSwitchToken = pending;
+      pending.resolve({ type: "qualityChangeRendered", mediaType: "video", oldQuality: pending.oQn, newQuality: target || playingId, isMediaSegment: true, requestType: "MediaSegment" });
+      notices?.log("清晰度切换完成", "新清晰度已经在播放，已通知 B 站播放器。", "success", "", playerRoute, "playback");
+    } catch (_error) {}
+  }
+
+  function armFastResolve() {
+    fastResolveUntil = Date.now() + 15000;
+    if (fastResolveTimer) return;
+    fastResolveTimer = setInterval(() => {
+      resolveNativeQualitySwitch();
+      let pending = null;
+      try { pending = root.player?.__core?.()?.qnSwitchingInfo?.video; } catch (_error) {}
+      if (Date.now() > fastResolveUntil || !pending?.switching || resolvedSwitchToken === pending) {
+        clearInterval(fastResolveTimer);
+        fastResolveTimer = null;
+      }
+    }, 150);
   }
 
   // The codec picked in the player's 播放策略 menu. Bilibili stores it as
@@ -887,7 +937,10 @@
       : event.target.closest(".bpx-player-ctrl-setting-codec") ? syncNativeCodec : null;
     if (!sync) return;
     // Capture phase runs before Bilibili's own handler; read the choice once it has run.
+    // The click also starts the core's pending switch, so the fast confirmation loop arms
+    // right away instead of waiting for the next one-second tick.
     setTimeout(sync, 0);
+    setTimeout(resolveNativeQualitySwitch, 50);
     setTimeout(sync, 300);
   }
 
@@ -1284,6 +1337,7 @@
     else {
       syncNativeQuality();
       syncNativeCodec();
+      resolveNativeQualitySwitch();
       refreshExpiringPlayinfo();
     }
     updateNativeInfoPanel();
@@ -1308,7 +1362,7 @@
           state: stats.playerState, lastError: stats.lastError, player: rest, nodes: stats.cdnHosts.map((item) => ({ ...item })), bannedNodes: cdnBans?.hosts?.() || [], page: pageEvents.slice(), timeline
         }, null, 1);
       },
-      version: "0.9.3.0"
+      version: "0.9.4.0"
     })
   });
   publish();

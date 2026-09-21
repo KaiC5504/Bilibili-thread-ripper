@@ -72,6 +72,7 @@
       </section>
 
       <section class="notice-controls" aria-label="提示设置">
+        <div class="notice-row"><label for="live-enabled">直播加速</label><label class="switch"><input id="live-enabled" type="checkbox" aria-label="直播加速"><span></span></label></div>
         <div class="notice-row"><label for="error-notices">显示错误</label><label class="switch"><input id="error-notices" type="checkbox" aria-label="显示错误"><span></span></label></div>
         <div class="notice-row"><label for="debug-notices">Debug 模式</label><label class="switch"><input id="debug-notices" type="checkbox" aria-label="Debug 模式"><span></span></label></div>
         <fieldset id="debug-filters" class="debug-filters" hidden>
@@ -220,6 +221,7 @@
     const sliderFill = $("slider-fill");
     const errorNotices = $("error-notices");
     const debugNotices = $("debug-notices");
+    const liveEnabled = $("live-enabled");
     const debugFilters = $("debug-filters");
     const debugCategoryInputs = [...shadow.querySelectorAll("[data-debug-category]")];
     const customSection = $("custom-hosts");
@@ -295,6 +297,7 @@
       setMode(settings.mode);
       customHosts = settings.customHosts;
       renderHosts();
+      liveEnabled.checked = settings.liveEnabled !== false;
       errorNotices.checked = settings.errorNotices;
       debugNotices.checked = settings.debugNotices;
       debugFilters.hidden = !settings.debugNotices;
@@ -303,6 +306,7 @@
 
     const saveDebugCategories = () => save({ debugCategories: Object.fromEntries(debugCategoryInputs.map((input) => [input.dataset.debugCategory, input.checked])) });
     enabled.addEventListener("change", () => save({ enabled: enabled.checked }));
+    liveEnabled.addEventListener("change", () => save({ liveEnabled: liveEnabled.checked }));
     concurrency.addEventListener("input", () => {
       const threads = THREAD_OPTIONS[Number(concurrency.value)];
       setSlider(threads);

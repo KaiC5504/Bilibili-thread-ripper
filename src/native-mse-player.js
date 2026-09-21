@@ -104,8 +104,12 @@
     const videos = Array.from(byQuality.values()).sort((a, b) =>
       (Number(b.height) || 0) - (Number(a.height) || 0) || frameRate(b) - frameRate(a) ||
       (Number(b.bandwidth) || 0) - (Number(a.bandwidth) || 0));
-    const audio = (dash.audio || []).filter((item) => supported(item, "audio"))
+    // Dolby and Hi-Res sources keep their tracks in dash.dolby.audio / dash.flac.audio;
+    // some of them have nothing in dash.audio at all, which used to fail the takeover.
+    // Ordinary tracks stay preferred, like the native player's default.
+    const audioOf = (list) => [].concat(list || []).filter((item) => supported(item, "audio"))
       .sort((a, b) => (Number(b.bandwidth) || 0) - (Number(a.bandwidth) || 0))[0];
+    const audio = audioOf(dash.audio) || audioOf(dash.flac?.audio) || audioOf(dash.dolby?.audio);
     if (!videos.length || !audio) throw new Error("浏览器不支持清单中的视频或音频编码");
     const requestedQuality = Number(body?.quality || body?.qn) || 0;
     const preferred = [Number(preferredQuality) || 0, requestedQuality]
@@ -194,6 +198,35 @@
     const segment = track?.sidx?.segments?.[track.startupIndex];
     if (segment?.durationSeconds > 0 && segment?.length > 0) return segment.length / segment.durationSeconds;
     return Math.max(0, Number(track?.representation?.bandwidth) || 0) / 8;
+  }
+
+  // While BTR plays the video, Bilibili's own core keeps timers that read its SourceBuffers,
+  // which detached from their MediaSource when the takeover replaced the element's source.
+  // HDR and 8K sources poll especially often, and every read throws InvalidStateError into
+  // the page's error reporting. While a takeover is active, such a read answers with an
+  // empty range instead; without one the browser behaves as before.
+  let bufferedShimInstalled = false;
+  function installBufferedShim() {
+    if (bufferedShimInstalled || !root.SourceBuffer) return;
+    const descriptor = Object.getOwnPropertyDescriptor(root.SourceBuffer.prototype, "buffered");
+    if (!descriptor?.get || !descriptor.configurable) return;
+    bufferedShimInstalled = true;
+    const emptyRanges = Object.freeze({
+      length: 0,
+      start() { throw new DOMException("空的缓冲区间", "IndexSizeError"); },
+      end() { throw new DOMException("空的缓冲区间", "IndexSizeError"); }
+    });
+    Object.defineProperty(root.SourceBuffer.prototype, "buffered", {
+      ...descriptor,
+      get() {
+        try {
+          return descriptor.get.call(this);
+        } catch (error) {
+          if (error?.name === "InvalidStateError" && document.querySelector('[data-btr-mse-active="true"]')) return emptyRanges;
+          throw error;
+        }
+      }
+    });
   }
 
   function createNativePlayer(options) {
@@ -973,7 +1006,7 @@
       urlDeadlineSeconds,
       video,
       getDebug: () => ({
-        version: "0.9.3.0",
+        version: "0.9.4.0",
         architecture: "bilibili-native-ui-progressive-mse-0.8-core",
         quality: qualityLabel(selectedVideo),
         qualityId: Number(selectedVideo?.id) || 0,
@@ -1007,5 +1040,6 @@
     });
   }
 
+  installBufferedShim();
   root.__BILI_NATIVE_MSE_PLAYER_FACTORY__ = Object.freeze({ createNativePlayer, qualityLabel, selectRepresentations });
 })(globalThis);
