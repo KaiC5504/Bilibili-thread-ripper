@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili 线程撕裂者
 // @namespace    https://github.com/MrTangLuyao/Bilibili-thread-ripper
-// @version      0.9.2.3
+// @version      0.9.3.0
 // @description  保留哔哩哔哩原生播放器，通过多 CDN、多 Range 并发下载改善视频缓冲速度。
 // @author       MrTangLuyao
 // @license      MIT
@@ -469,17 +469,25 @@ const chrome = (() => {
         });
       if (!pool.length) return urls();
       const firstRange = mediaRangeCount === 0;
-      const width = Math.min(firstRange ? pool.length : 3, pool.length);
+      const width = Math.min(firstRange ? pool.length : 6, pool.length);
       let selected;
       const warmupRanges = getMode?.() === "mainland" ? 1 : 4;
       if (mediaRangeCount < warmupRanges) {
         selected = pool.slice(0, width);
         rangeCursor = width % pool.length;
       } else {
-        const offset = rangeCursor % pool.length;
-        const rotated = pool.slice(offset).concat(pool.slice(0, offset));
-        selected = rotated.slice(0, width);
-        rangeCursor = (rangeCursor + width) % pool.length;
+        // After the warm-up the measured nodes carry the segments in speed order; the
+        // downloader gives the fast ones the larger share. One untested node rides along
+        // per segment, so a route that has never answered still gets its chance.
+        const measured = pool.filter((url) => health.get(url)?.lastSuccessAt);
+        const rest = pool.filter((url) => !health.get(url)?.lastSuccessAt);
+        const explore = rest.length ? [rest[rangeCursor % rest.length]] : [];
+        rangeCursor = (rangeCursor + 1) % Math.max(1, pool.length);
+        selected = [...measured.slice(0, width - explore.length), ...explore];
+        for (const url of pool) {
+          if (selected.length >= Math.min(3, pool.length)) break;
+          if (!selected.includes(url)) selected.push(url);
+        }
       }
       mediaRangeCount += 1;
       return selected;
@@ -552,7 +560,9 @@ const chrome = (() => {
     }
 
     const allows = (url) => !bans || bans.allows(url);
-    return Object.freeze({ allows, failure, ordered, rangeCandidates, rescueCandidates, startupCandidates, status, success, urls });
+    // The measured download speed of an address, for weighting piece assignments.
+    const speed = (url) => health.get(url)?.bps || 0;
+    return Object.freeze({ allows, failure, ordered, rangeCandidates, rescueCandidates, speed, startupCandidates, status, success, urls });
   }
 
   root.__BILI_CDN_RESOLVER_FACTORY__ = Object.freeze({
@@ -692,6 +702,8 @@ const chrome = (() => {
 
   const PIECE_ROUNDS = 3;
   const PIECE_RETRY_WINDOW_MS = 25000;
+  // Below this a resumed request saves less than its own round trip costs.
+  const RESUME_MIN_BYTES = 32 * 1024;
 
   function abortError(reason) {
     if (reason instanceof Error || reason instanceof DOMException) return reason;
@@ -759,12 +771,54 @@ const chrome = (() => {
     const nativeFetch = options.nativeFetch || root.fetch.bind(root);
     const getSettings = options.getSettings;
     const onTransfer = typeof options.onTransfer === "function" ? options.onTransfer : () => null;
-    const semaphore = new Semaphore(core.normalizeSettings(getSettings()).concurrency);
+    // The page replaces its settings object when something changes, so the reference
+    // tells whether the previous normalization is still valid.
+    let rawSettings = null;
+    let normalizedSettings = null;
+    function config() {
+      const raw = getSettings();
+      if (raw !== rawSettings || !normalizedSettings) {
+        rawSettings = raw;
+        normalizedSettings = core.normalizeSettings(raw);
+      }
+      return normalizedSettings;
+    }
+    const semaphore = new Semaphore(config().concurrency);
+
+    // What one connection typically delivers here and how long a sub-chunk typically
+    // takes. Sub-chunk sizing and the hedge delay follow these measurements.
+    const meter = { connectionBps: 0, pieceMs: 0 };
+    function recordMeter(bytes, elapsedMs) {
+      if (bytes < 48 * 1024 || elapsedMs <= 0) return;
+      const bps = bytes * 1000 / elapsedMs;
+      meter.connectionBps = meter.connectionBps ? meter.connectionBps * 0.7 + bps * 0.3 : bps;
+      meter.pieceMs = meter.pieceMs ? meter.pieceMs * 0.7 + elapsedMs * 0.3 : elapsedMs;
+    }
+
+    // A sub-chunk should keep its connection busy for a good part of a second, otherwise
+    // request round trips dominate on high-latency routes. 64 KiB stays the floor while
+    // the speed is still unknown, and a range still splits into at least one piece per
+    // node: the total bandwidth only grows by spreading over hosts, and the hedges
+    // against a stalling one need more than a single request to work with.
+    function adaptiveMinChunk(settings, rangeLength, pieceLimit, hostCount = 4) {
+      if (!meter.connectionBps) return settings.minChunkBytes;
+      const target = Math.floor(meter.connectionBps * 0.6 / (64 * 1024)) * 64 * 1024;
+      const spread = Math.ceil(rangeLength / Math.max(1, Math.min(Math.max(4, hostCount), pieceLimit)));
+      return Math.max(settings.minChunkBytes, Math.min(1024 * 1024, target, spread));
+    }
+
+    // A second copy starts once a piece takes clearly longer than pieces have been
+    // taking, instead of always waiting the full fixed delay.
+    function hedgeDelayMs(settings) {
+      if (!meter.pieceMs) return settings.hedgeDelayMs;
+      return Math.max(250, Math.min(settings.hedgeDelayMs, Math.round(meter.pieceMs * 1.5)));
+    }
 
     async function readBody(response, controller, transferId, settings, received) {
       if (!response.body?.getReader) {
         const bytes = new Uint8Array(await response.arrayBuffer());
         received.bytes += bytes.byteLength;
+        received.chunks?.push(bytes);
         onTransfer({ phase: "progress", id: transferId, bytes: bytes.byteLength });
         return bytes;
       }
@@ -792,6 +846,9 @@ const chrome = (() => {
           chunks.push(chunk);
           total += chunk.byteLength;
           received.bytes += chunk.byteLength;
+          // The recorder keeps what a failed attempt already received, so a retry or a
+          // hedge copy can ask only for the missing tail.
+          received.chunks?.push(chunk);
           onTransfer({ phase: "progress", id: transferId, bytes: chunk.byteLength });
         }
       } finally {
@@ -808,8 +865,8 @@ const chrome = (() => {
       return bytes;
     }
 
-    async function attempt(piece, url, signal, kind, resolver, priority = 0) {
-      const settings = core.normalizeSettings(getSettings());
+    async function attempt(piece, url, signal, kind, resolver, priority = 0, received = { bytes: 0, chunks: [] }) {
+      const settings = config();
       const release = await semaphore.acquire(signal, priority);
       const controller = new AbortController();
       const cancel = () => controller.abort(abortError(signal?.reason));
@@ -819,7 +876,6 @@ const chrome = (() => {
       const totalTimer = setTimeout(() => controller.abort(new DOMException("CDN 子块总耗时超限", "TimeoutError")), settings.attemptTimeoutMs);
       const transferId = onTransfer({ phase: "start", kind, totalBytes: piece.length, url });
       const startedAt = performance.now();
-      const received = { bytes: 0 };
       try {
         const response = await nativeFetch(url, {
           method: "GET",
@@ -829,6 +885,7 @@ const chrome = (() => {
           mode: "cors",
           referrer: root.location?.href,
           referrerPolicy: "strict-origin-when-cross-origin",
+          priority: priority >= 100 ? "high" : "auto",
           signal: controller.signal
         });
         clearTimeout(firstByteTimer);
@@ -839,8 +896,9 @@ const chrome = (() => {
         }
         const bytes = await readBody(response, controller, transferId, settings, received);
         if (bytes.byteLength !== piece.length) throw new Error(`子块长度不符：${bytes.byteLength}/${piece.length}`);
-        const seconds = Math.max(0.001, (performance.now() - startedAt) / 1000);
-        resolver.success(url, bytes.byteLength / seconds);
+        const elapsedMs = Math.max(1, performance.now() - startedAt);
+        recordMeter(bytes.byteLength, elapsedMs);
+        resolver.success(url, bytes.byteLength * 1000 / elapsedMs);
         onTransfer({ phase: "done", id: transferId });
         return { bytes, total: contentRange.total, url };
       } catch (error) {
@@ -878,10 +936,23 @@ const chrome = (() => {
 
     function pieceCandidates(piece, resolver, preferredUrls, round) {
       const preferred = Array.isArray(preferredUrls) ? preferredUrls : [];
-      const preferredOffset = preferred.length ? (piece.index + round) % preferred.length : 0;
+      // The first preferred address is the node this piece was assigned to by speed;
+      // only a retry round moves past it.
+      const preferredOffset = preferred.length ? round % preferred.length : 0;
       const rotatedPreferred = preferred.slice(preferredOffset).concat(preferred.slice(0, preferredOffset));
       const rescue = (typeof resolver.rescueCandidates === "function" ? resolver.rescueCandidates() : resolver.ordered(piece.index))
         .filter((url) => !rotatedPreferred.includes(url));
+      if (typeof resolver.speed === "function") {
+        // The copies after the first go to the fastest known nodes, wherever they were
+        // listed: a hedge that lands on the slowest node saves nothing.
+        const rest = [...rotatedPreferred.slice(1), ...rescue]
+          .sort((left, right) => resolver.speed(right) - resolver.speed(left));
+        const candidates = rotatedPreferred.length ? [rotatedPreferred[0], ...rest] : rest;
+        for (const url of resolver.ordered(piece.index)) {
+          if (!candidates.includes(url)) candidates.push(url);
+        }
+        return candidates;
+      }
       const candidates = [];
       const width = Math.max(rotatedPreferred.length, rescue.length);
       for (let index = 0; index < width; index += 1) {
@@ -895,12 +966,31 @@ const chrome = (() => {
     }
 
     async function downloadPiece(piece, resolver, signal, kind, preferredUrls, startupMode = false, priority = 0) {
-      const settings = core.normalizeSettings(getSettings());
+      const settings = config();
       const allowed = (url) => typeof resolver.allows !== "function" || resolver.allows(url);
       const startup = startupMode === true || startupMode === "probe";
       const probe = startupMode === "probe";
       const startedAt = performance.now();
       let lastError = null;
+
+      // The longest contiguous run of bytes fetched from the front of this piece so far.
+      // A retry or a hedge copy asks only for what is still missing and splices the two
+      // halves, instead of downloading the whole piece again. Every kept byte came out
+      // of a response whose 206 Content-Range was verified against this piece.
+      let prefix = null;
+      const keepProgress = (base, recorder) => {
+        const bytes = (base?.bytes || 0) + recorder.bytes;
+        if (bytes > (prefix?.bytes || 0) && bytes < piece.length) {
+          prefix = { bytes, chunks: base ? [...base.chunks, ...recorder.chunks] : recorder.chunks.slice() };
+        }
+      };
+      const liveProgress = (context) => {
+        if (!context) return null;
+        const chunks = context.recorder.chunks.slice();
+        let bytes = context.base?.bytes || 0;
+        for (const chunk of chunks) bytes += chunk.byteLength;
+        return { bytes, chunks: context.base ? [...context.base.chunks, ...chunks] : chunks };
+      };
 
       // Failing a piece ends acceleration for the whole video, and the list can be as short as
       // one working address. One slow reply must not decide that, so the list is walked again
@@ -930,9 +1020,10 @@ const chrome = (() => {
           // for the rest of the hedge delay.
           let firstFailed = () => {};
           const firstFailure = new Promise((resolve) => { firstFailed = resolve; });
+          const contexts = [];
           const attempts = pair.map((url, pairIndex) => (async () => {
             if (pairIndex) await new Promise((resolve, reject) => {
-              const delay = probe ? 0 : startup ? Math.min(250, settings.hedgeDelayMs) : settings.hedgeDelayMs;
+              const delay = probe ? 0 : startup ? Math.min(250, settings.hedgeDelayMs) : hedgeDelayMs(settings);
               const timer = setTimeout(resolve, delay);
               firstFailure.then(() => {
                 clearTimeout(timer);
@@ -945,9 +1036,26 @@ const chrome = (() => {
               if (controllers[pairIndex].signal.aborted) canceled();
               else controllers[pairIndex].signal.addEventListener("abort", canceled, { once: true });
             });
+            // Resume from the longest prefix known right now: an earlier failed attempt,
+            // or what the still-running first copy has already received.
+            let base = prefix && prefix.bytes >= RESUME_MIN_BYTES ? prefix : null;
+            if (pairIndex) {
+              const live = liveProgress(contexts[0]);
+              if (live && live.bytes >= RESUME_MIN_BYTES && live.bytes > (base?.bytes || 0)) base = live;
+            }
+            if (base && base.bytes >= piece.length) base = null;
+            const recorder = { bytes: 0, chunks: [] };
+            contexts[pairIndex] = { base, recorder };
+            const part = base
+              ? { index: piece.index, start: piece.start + base.bytes, end: piece.end, length: piece.length - base.bytes }
+              : piece;
             try {
-              return await attempt(piece, url, controllers[pairIndex].signal, kind, resolver, priority + (pairIndex ? 20 : 0));
+              const result = await attempt(part, url, controllers[pairIndex].signal, kind, resolver, priority + (pairIndex ? 20 : 0), recorder);
+              return base
+                ? { bytes: core.concatChunks([...base.chunks, result.bytes], piece.length), total: result.total, url: result.url }
+                : result;
             } catch (error) {
+              keepProgress(base, recorder);
               if (!pairIndex) firstFailed();
               throw error;
             }
@@ -1018,8 +1126,46 @@ const chrome = (() => {
       }
     }
 
+    // Which address each piece tries first. The fastest node gets the most pieces, a node
+    // without a measurement gets the average of the measured ones, and a node measured at
+    // under a twelfth of the best is left out entirely: a piece it starts has to be rescued
+    // anyway. Slow and untested nodes come back through the resolver's exploration slot.
+    function assignPrimaries(urls, resolver, count) {
+      if (!urls.length || count <= 0) return [];
+      if (urls.length === 1) return new Array(count).fill(urls[0]);
+      const measure = typeof resolver.speed === "function" ? (url) => Math.max(0, Number(resolver.speed(url)) || 0) : () => 0;
+      let known = urls.map(measure);
+      const positive = known.filter((value) => value > 0);
+      if (!positive.length) return Array.from({ length: count }, (_ignored, index) => urls[index % urls.length]);
+      const top = Math.max(...known);
+      const eligible = urls.filter((_url, index) => !known[index] || known[index] >= top / 12);
+      if (eligible.length && eligible.length < urls.length) {
+        urls = eligible;
+        known = urls.map(measure);
+      }
+      const fallback = positive.reduce((sum, value) => sum + value, 0) / positive.length;
+      const weights = known.map((value) => Math.max(value || fallback, top * 0.05));
+      const total = weights.reduce((sum, value) => sum + value, 0);
+      const primaries = [];
+      let urlIndex = 0;
+      let covered = weights[0];
+      for (let index = 0; index < count; index += 1) {
+        const point = (index + 0.5) * total / count;
+        while (covered < point && urlIndex < urls.length - 1) {
+          urlIndex += 1;
+          covered += weights[urlIndex];
+        }
+        primaries.push(urls[urlIndex]);
+      }
+      return primaries;
+    }
+
+    function preferredFor(primary, urls) {
+      return primary ? [primary, ...urls.filter((url) => url !== primary)] : urls;
+    }
+
     async function downloadStartupRange(range, resolver, options) {
-      semaphore.setLimit(core.normalizeSettings(getSettings()).concurrency);
+      semaphore.setLimit(config().concurrency);
       const piece = { index: 0, start: range.start, end: range.end, length: range.length };
       const startedAt = performance.now();
       let lastError = null;
@@ -1095,7 +1241,7 @@ const chrome = (() => {
         head.end + 1,
         range.end,
         pieceBudget,
-        settings.minChunkBytes
+        adaptiveMinChunk(settings, range.end - head.end, pieceBudget, candidateUrls.length)
       ).map((piece, index) => ({ ...piece, index: index + 1 }));
       const ordered = new Array(pieces.length);
       let nextOrderedIndex = 0;
@@ -1111,13 +1257,16 @@ const chrome = (() => {
         });
         return flushOperation;
       };
+      // The probe measured at least its own winner, so the pieces spread over the nodes by
+      // speed at once; the proven address stays each piece's first fallback.
+      const primaries = assignPrimaries(candidateUrls, resolver, pieces.length);
       const pendingPieces = pieces.map(async (piece, orderedIndex) => {
         const result = await downloadPiece(
           piece,
           resolver,
           options.signal,
           options.kind || "media",
-          [headResult.url],
+          preferredFor(primaries[orderedIndex], [headResult.url, ...candidateUrls.filter((url) => url !== headResult.url)]),
           true,
           120 - Math.min(30, piece.index)
         );
@@ -1141,7 +1290,7 @@ const chrome = (() => {
     }
 
     async function downloadRange(range, resolver, options = {}) {
-      const settings = core.normalizeSettings(getSettings());
+      const settings = config();
       if (options.kind === "meta") return downloadStartupRange(range, resolver, options);
       const parallel = options.parallel !== false;
       if (options.startup === true && parallel && typeof options.onOrderedChunk === "function") {
@@ -1169,8 +1318,9 @@ const chrome = (() => {
         range.start,
         range.end,
         pieceConcurrency,
-        parallel ? settings.minChunkBytes : Number.MAX_SAFE_INTEGER
+        parallel ? adaptiveMinChunk(settings, range.length, pieceConcurrency, preferredUrls.length) : Number.MAX_SAFE_INTEGER
       );
+      const primaries = parallel ? assignPrimaries(preferredUrls, resolver, pieces.length) : [];
       const progressive = typeof options.onOrderedChunk === "function";
       const ordered = new Array(pieces.length);
       let nextOrderedIndex = 0;
@@ -1192,7 +1342,7 @@ const chrome = (() => {
           resolver,
           options.signal,
           options.kind || "media",
-          preferredUrls,
+          preferredFor(primaries[piece.index], preferredUrls),
           options.startup === true,
           basePriority - Math.min(20, piece.index)
         );
@@ -1215,7 +1365,7 @@ const chrome = (() => {
       };
     }
 
-    return Object.freeze({ downloadRange, applySettings: () => semaphore.setLimit(core.normalizeSettings(getSettings()).concurrency) });
+    return Object.freeze({ downloadRange, applySettings: () => semaphore.setLimit(config().concurrency) });
   }
 
   root.__BILI_IDM_DOWNLOADER_FACTORY__ = Object.freeze({ createDownloader });
@@ -1510,7 +1660,27 @@ const chrome = (() => {
     function append(candidate, track, bytes, generation) {
       return queuedSourceOperation(candidate, track, async () => {
         if (!sessionIsCurrent(candidate) || generation !== candidate.generation) return;
-        track.sourceBuffer.appendBuffer(bytes);
+        try {
+          track.sourceBuffer.appendBuffer(bytes);
+        } catch (error) {
+          // The browser caps how much a SourceBuffer holds (about 150 MB of video in
+          // Chromium), which a 4K video reaches within the 45 second window. Freeing
+          // played data and asking for less ahead keeps the video playing; failing the
+          // append here would hand the whole video back to Bilibili.
+          if (error?.name !== "QuotaExceededError") throw error;
+          const current = Number(video.currentTime) || 0;
+          const ahead = Math.max(0, bufferedEndAt(track.sourceBuffer, current) - current);
+          candidate.bufferAheadLimit = Math.max(15, Math.min(candidate.bufferAheadLimit || Infinity, ahead * 0.75));
+          note("buffer quota hit", `${track.kind} keeps ${candidate.bufferAheadLimit.toFixed(0)}s ahead`);
+          options.onLog?.("浏览器缓冲区满了", `已释放播放过的数据，这个视频接下来最多提前缓冲 ${candidate.bufferAheadLimit.toFixed(0)} 秒。`, "info", "buffer");
+          const behindEnd = Math.max(0, current - 5);
+          if (behindEnd > 0 && bufferedStart(track.sourceBuffer, behindEnd) < behindEnd) {
+            track.sourceBuffer.remove(0, behindEnd);
+            await waitEvent(track.sourceBuffer, "updateend", "error", candidate.controller.signal);
+          }
+          if (!sessionIsCurrent(candidate) || generation !== candidate.generation) return;
+          track.sourceBuffer.appendBuffer(bytes);
+        }
         await waitEvent(track.sourceBuffer, "updateend", "error", candidate.controller.signal);
       });
     }
@@ -1607,6 +1777,12 @@ const chrome = (() => {
       ensureBuffer(candidate);
     }
 
+    // How far ahead this session may buffer: the setting, brought down when the
+    // browser's own buffer quota was hit.
+    function aheadTarget(candidate) {
+      return Math.min(core.normalizeSettings(getSettings()).bufferAheadSeconds, candidate.bufferAheadLimit || Infinity);
+    }
+
     async function fillTrack(candidate, track) {
       if (track.filling || track.complete || !sessionIsCurrent(candidate) || candidate.fatal) return;
       track.filling = true;
@@ -1619,7 +1795,7 @@ const chrome = (() => {
             track.complete = true;
             break;
           }
-          if (bufferedEndAt(track.sourceBuffer, current) - current >= core.normalizeSettings(getSettings()).bufferAheadSeconds) break;
+          if (bufferedEndAt(track.sourceBuffer, current) - current >= aheadTarget(candidate)) break;
           // A sliding window: the next segment starts as soon as one has been appended. Waiting
           // for a whole batch left the connections idle until its slowest segment arrived.
           const windowSize = track.started ? (track.kind === "video" ? 3 : 4) : 1;
@@ -1627,7 +1803,7 @@ const chrome = (() => {
           for (let offset = 0; offset < windowSize; offset += 1) {
             const index = track.nextIndex + offset;
             const segment = track.sidx.segments[index];
-            if (!segment || projectedEnd - current >= core.normalizeSettings(getSettings()).bufferAheadSeconds) break;
+            if (!segment || projectedEnd - current >= aheadTarget(candidate)) break;
             projectedEnd = segment.endTime;
             if (track.prefetches.has(index)) continue;
             const startup = !track.startupComplete && index === track.startupIndex;
@@ -1835,7 +2011,7 @@ const chrome = (() => {
         controller: new AbortController(), mediaSource, objectUrl,
         timer: null, endRetryTimer: null, tracks: [], ending: false, streamEnded: false,
         playAttempted: false, playbackActivated: false, playbackActivatedAt: 0,
-        recovering: false, recoveryTargetSeconds: STARTUP_RECOVERY_SECONDS,
+        recovering: false, recoveryTargetSeconds: STARTUP_RECOVERY_SECONDS, bufferAheadLimit: 0,
         startupCompletedBytes: 0, startupPrefetchLaunched: false, startupStartedAt: performance.now(),
         progressiveAppends: 0,
         startupTargetSeconds: 6, startupThroughputBps: 0, mediaBytesPerSecond: 0,
@@ -1979,14 +2155,42 @@ const chrome = (() => {
       };
     }
 
+    // A refreshed playinfo names the same files with fresh signatures. The resolvers of a
+    // running session keep reading their representation objects, so those objects receive
+    // the new addresses; nothing else about the session changes.
+    function refreshRepresentationUrls(target, source) {
+      if (!target || !source || target === source) return;
+      for (const key of ["baseUrl", "base_url", "backupUrl", "backup_url", "backup_url_list"]) {
+        if (source[key] !== undefined) target[key] = source[key];
+      }
+    }
+
+    // When the earliest signed address of the playing tracks expires, in seconds since the
+    // epoch. 0 when no address carries a deadline.
+    function urlDeadlineSeconds() {
+      let earliest = 0;
+      for (const representation of [selectedVideo, selection.audio]) {
+        try {
+          const deadline = Number(new URL(representationUrl(representation)).searchParams.get("deadline")) || 0;
+          if (deadline > 0 && (!earliest || deadline < earliest)) earliest = deadline;
+        } catch (_error) {}
+      }
+      return earliest;
+    }
+
     async function updatePlayinfo(playinfo) {
       if (destroyed) return;
       const next = selectRepresentations(playinfo, preferredQuality, preferredCodec);
       currentPlayinfo = playinfo;
       const nextVideo = next.preferred;
-      const audioChanged = !sameRepresentation(selection.audio, next.audio);
+      const previousAudio = selection.audio;
+      const audioChanged = !sameRepresentation(previousAudio, next.audio);
       selection = next;
-      if (!audioChanged && sameRepresentation(selectedVideo, nextVideo)) return;
+      if (!audioChanged && sameRepresentation(selectedVideo, nextVideo)) {
+        refreshRepresentationUrls(selectedVideo, nextVideo);
+        refreshRepresentationUrls(previousAudio, next.audio);
+        return;
+      }
       await startSession(nextVideo, playbackState());
     }
 
@@ -2071,9 +2275,10 @@ const chrome = (() => {
       setCodec,
       setQuality,
       updatePlayinfo,
+      urlDeadlineSeconds,
       video,
       getDebug: () => ({
-        version: "0.9.2.3",
+        version: "0.9.3.0",
         architecture: "bilibili-native-ui-progressive-mse-0.8-core",
         quality: qualityLabel(selectedVideo),
         qualityId: Number(selectedVideo?.id) || 0,
@@ -2095,6 +2300,8 @@ const chrome = (() => {
         sessionStartTime: session?.startTime || 0,
         startupBufferSeconds: session?.startupTargetSeconds || 0,
         startupWaitingEvents: session?.startupWaitingEvents || 0,
+        bufferAheadLimit: session?.bufferAheadLimit || 0,
+        urlDeadline: urlDeadlineSeconds(),
         progressiveAppends: session?.progressiveAppends || 0,
         seekReloads,
         lastSeekMs: Math.round(lastSeekMs),
@@ -3320,7 +3527,7 @@ const chrome = (() => {
   let transferSequence = 1;
   const transfers = new Map();
   const stats = {
-    version: "0.9.2.3",
+    version: "0.9.3.0",
     architecture: "bilibili-native-ui-progressive-mse-0.8-core",
     mode: settings.mode,
     playerState: "waiting",
@@ -3755,6 +3962,31 @@ const chrome = (() => {
       }
       return nativeXhrSend.apply(this, args);
     };
+  }
+
+  // Bilibili's signed download addresses expire (their deadline parameter). A long pause
+  // used to run into that: every node answers 403 at once, a ban round starts and the video
+  // stalls. New addresses are requested shortly before the old ones expire instead.
+  let deadlineRefresh = { route: "", deadline: 0, at: 0 };
+  async function refreshExpiringPlayinfo() {
+    if (!player || !playerRoute || typeof player.urlDeadlineSeconds !== "function") return;
+    const identity = routeIdentity();
+    if (!identity || identity.key !== playerRoute) return;
+    const deadline = player.urlDeadlineSeconds() || 0;
+    if (!deadline || Date.now() / 1000 < deadline - 120) return;
+    const now = Date.now();
+    if (deadlineRefresh.route === playerRoute && now - deadlineRefresh.at < 45000) return;
+    deadlineRefresh = { route: playerRoute, deadline, at: now };
+    const route = playerRoute;
+    const lifecycle = playerLifecycle;
+    notices?.log("下载地址快要过期了", "正在向 B 站请求新的下载地址，播放不受影响。", "info", "", route, "download");
+    try {
+      const playinfo = await fetchRoutePlayinfo(identity, null);
+      if (lifecycle !== playerLifecycle || playerRoute !== route || routeIdentity()?.key !== route) return;
+      await player.updatePlayinfo?.(playinfo);
+    } catch (error) {
+      notices?.log("没能提前换新下载地址", `${String(error?.message || error).slice(0, 120)}\n播放继续使用现在的地址，稍后再试。`, "info", "", route, "download");
+    }
   }
 
   async function fetchRoutePlayinfo(identity, signal) {
@@ -4462,6 +4694,7 @@ const chrome = (() => {
     else {
       syncNativeQuality();
       syncNativeCodec();
+      refreshExpiringPlayinfo();
     }
     updateNativeInfoPanel();
     syncSettingsMenu();
@@ -4485,7 +4718,7 @@ const chrome = (() => {
           state: stats.playerState, lastError: stats.lastError, player: rest, nodes: stats.cdnHosts.map((item) => ({ ...item })), bannedNodes: cdnBans?.hosts?.() || [], page: pageEvents.slice(), timeline
         }, null, 1);
       },
-      version: "0.9.2.3"
+      version: "0.9.3.0"
     })
   });
   publish();
@@ -4802,7 +5035,7 @@ const chrome = (() => {
   "use strict";
 
   const CHANNEL = "__BILI_RANGE_ACCELERATOR_V1__";
-  const VERSION = "0.9.2.3";
+  const VERSION = "0.9.3.0";
   const notices = globalThis.__BTR_NOTIFICATION_VIEW__;
   const ERROR_NOTICE_ID = "__bilibili_thread_ripper_error_notice__";
   const ERROR_NOTICE_STYLE_ID = "__bilibili_thread_ripper_error_notice_style__";

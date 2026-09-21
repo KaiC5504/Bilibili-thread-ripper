@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>BTR quota recovery and playinfo refresh regression test</title>
+</head>
+<body>
+  <div class="bpx-player-container"><video muted></video></div>
+  <pre id="quota-refresh-result">starting</pre>
+  <script src="/src/range-core.js"></script>
+  <script src="/src/cdn-resolver.js"></script>
+  <script src="/dev/quota-refresh-test.js"></script>
+  <script src="/src/native-mse-player.js"></script>
+  <script>window.__runQuotaRefreshTest();</script>
+</body>
+</html>
