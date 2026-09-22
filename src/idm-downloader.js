@@ -11,7 +11,6 @@
   // A shorter transfer is mostly round trip. The tail of a resumed piece can be a few KiB,
   // and counting it would mark down the very node that came to the rescue.
   const SPEED_SAMPLE_MIN_BYTES = 48 * 1024;
-  const URGENT_PRIORITY = 200;
 
   function abortError(reason) {
     if (reason instanceof Error || reason instanceof DOMException) return reason;
@@ -21,15 +20,13 @@
   class Semaphore {
     constructor(limit) {
       this.limit = limit;
-      this.reserve = 0;
       this.active = 0;
       this.queue = [];
       this.sequence = 0;
     }
 
-    setLimit(limit, reserve = this.reserve) {
+    setLimit(limit) {
       this.limit = Math.max(1, Math.min(512, Math.trunc(limit) || 1));
-      this.reserve = Math.max(0, Math.min(this.limit - 1, Math.trunc(reserve) || 0));
       this.drain();
     }
 
@@ -39,12 +36,15 @@
 
     drainQueue() {
       while (this.active < this.limit && this.queue.length) {
-        // Keep a small number of slots genuinely available for playback-critical
-        // or rescue work. Normal work may borrow them only when no urgent waiter exists.
-        const urgent = this.queue.findIndex(entry => entry.priority >= URGENT_PRIORITY);
-        const normalAllowed = this.active < this.limit - this.reserve;
-        if (urgent < 0 && !normalAllowed) break;
-        const entry = this.queue.splice(urgent >= 0 ? urgent : 0, 1)[0];
+        let best = 0;
+        for (let index = 1; index < this.queue.length; index += 1) {
+          const candidate = this.queue[index], current = this.queue[best];
+          if (candidate.deadlineAt < current.deadlineAt
+            || (candidate.deadlineAt === current.deadlineAt && candidate.priority > current.priority)
+            || (candidate.deadlineAt === current.deadlineAt && candidate.priority === current.priority
+              && candidate.sequence < current.sequence)) best = index;
+        }
+        const entry = this.queue.splice(best, 1)[0];
         entry.signal?.removeEventListener("abort", entry.cancel);
         if (entry.signal?.aborted) {
           entry.reject(abortError(entry.signal.reason));
@@ -60,7 +60,7 @@
       }
     }
 
-    acquire(signal, priority = 0) {
+    acquire(signal, priority = 0, deadlineAt = Infinity) {
       if (signal?.aborted) return Promise.reject(abortError(signal.reason));
       return new Promise((resolve, reject) => {
         const entry = {
@@ -69,6 +69,7 @@
           signal,
           released: false,
           priority: Number(priority) || 0,
+          deadlineAt: Number.isFinite(deadlineAt) ? deadlineAt : Infinity,
           sequence: this.sequence++
         };
         entry.cancel = () => {
@@ -80,7 +81,6 @@
         };
         signal?.addEventListener("abort", entry.cancel, { once: true });
         this.queue.push(entry);
-        this.queue.sort((a, b) => b.priority - a.priority || a.sequence - b.sequence);
         this.drain();
         this.onChange?.(this.active, this.limit, this.queue.length);
       });
@@ -345,14 +345,16 @@
 
     // A second copy starts once a piece takes clearly longer than pieces have been
     // taking, instead of always waiting the full fixed delay.
-    function hedgeDelayMs(settings, deadlineMs = Infinity) {
+    function hedgeDelayMs(settings, deadlineAt = Infinity) {
       const measured = meter.pieceMs
         ? Math.max(250, Math.min(settings.hedgeDelayMs, Math.round(meter.pieceMs * 1.5)))
         : settings.hedgeDelayMs;
-      if (!Number.isFinite(deadlineMs) || deadlineMs <= 0) return measured;
+      if (!Number.isFinite(deadlineAt)) return measured;
+      const remainingMs = deadlineAt - performance.now();
+      if (remainingMs <= 0) return 0;
       // A piece whose predicted playback deadline is close should hedge earlier,
       // while retaining a short floor to avoid duplicating every tiny request.
-      return Math.max(150, Math.min(measured, Math.floor(deadlineMs * 0.35)));
+      return Math.max(150, Math.min(measured, Math.floor(remainingMs * 0.35)));
     }
 
     async function readBody(response, controller, transferId, settings, received, report = onTransfer) {
@@ -411,9 +413,9 @@
     // begin: called once the request has its connection slot, and returns what to ask for.
     // A copy that waited in the queue resumes from what the first copy has received by then,
     // not from what it had when the copy was queued.
-    async function attempt(piece, url, signal, kind, resolver, priority = 0, begin = null) {
+    async function attempt(piece, url, signal, kind, resolver, priority = 0, begin = null, deadlineAt = Infinity) {
       const settings = config();
-      const release = await semaphore.acquire(signal, priority);
+      const release = await semaphore.acquire(signal, priority, deadlineAt);
       let received = { bytes: 0, chunks: [] };
       if (begin) {
         try {
@@ -547,6 +549,9 @@
       const startup = startupMode === true || startupMode === "probe";
       const probe = startupMode === "probe";
       const startedAt = performance.now();
+      const deadlineAt = Number.isFinite(Number(deadlineMs))
+        ? startedAt + Math.max(0, Number(deadlineMs))
+        : Infinity;
       let lastError = null;
 
       // The longest contiguous run of bytes fetched from the front of this piece so far.
@@ -599,7 +604,9 @@
           const contexts = [];
           const attempts = pair.map((url, pairIndex) => (async () => {
             if (pairIndex) await new Promise((resolve, reject) => {
-              const delay = probe ? 0 : startup ? Math.min(250, settings.hedgeDelayMs) : hedgeDelayMs(settings, deadlineMs);
+              const delay = probe ? 0 : startup
+                ? Math.min(250, hedgeDelayMs(settings, deadlineAt))
+                : hedgeDelayMs(settings, deadlineAt);
               const timer = setTimeout(resolve, delay);
               firstFailure.then(() => {
                 clearTimeout(timer);
@@ -632,7 +639,8 @@
               };
             };
             try {
-              const result = await attempt(piece, url, controllers[pairIndex].signal, kind, resolver, priority + (pairIndex ? 20 : 0), begin);
+              const result = await attempt(piece, url, controllers[pairIndex].signal, kind, resolver,
+                priority + (pairIndex ? 20 : 0), begin, deadlineAt);
               return base
                 ? { bytes: core.concatChunks([...base.chunks, result.bytes], piece.length), total: result.total, url: result.url }
                 : result;
@@ -781,7 +789,7 @@
     }
 
     async function downloadStartupRange(range, resolver, options) {
-      semaphore.setLimit(config().concurrency, 0);
+      semaphore.setLimit(config().concurrency);
       const piece = { index: 0, start: range.start, end: range.end, length: range.length };
       const startedAt = performance.now();
       let lastError = null;
@@ -815,8 +823,7 @@
 
     async function downloadStartupMediaRange(range, resolver, options, settings) {
       const effectiveConcurrency = settings.concurrency;
-      const rescueReserve = Math.max(1, Math.min(16, Math.ceil(effectiveConcurrency / 8)));
-      semaphore.setLimit(effectiveConcurrency, rescueReserve);
+      semaphore.setLimit(effectiveConcurrency);
       const candidateUrls = (typeof resolver.rangeCandidates === "function" ? resolver.rangeCandidates() : resolver.urls())
         .filter((url, index, all) => all.indexOf(url) === index);
       const headLength = Math.min(range.length, Math.max(64 * 1024, settings.minChunkBytes));
@@ -833,7 +840,8 @@
         options.kind || "media",
         candidateUrls,
         "probe",
-        220
+        220,
+        options.deadlineMs
       );
       await options.onOrderedChunk(headResult.bytes, head, headResult.total);
       if (head.end >= range.end) {
@@ -848,7 +856,7 @@
         };
       }
 
-      const mediaBudget = Math.max(1, effectiveConcurrency - rescueReserve);
+      const mediaBudget = effectiveConcurrency;
       const audioBudget = Math.max(1, Math.min(mediaBudget, Math.ceil(effectiveConcurrency / 8)));
       const pieceBudget = options.kind === "audio"
         ? audioBudget
@@ -926,20 +934,11 @@
         ? Math.max(1, Math.trunc(Number(options.maxConcurrency)))
         : globalConcurrency;
       const effectiveConcurrency = parallel ? Math.min(globalConcurrency, requestedConcurrency) : 1;
-      // 后台预取可以限制自己的子块数，但不能降低全局信号量上限；
-      // 否则一个低优先级预取会把后续播放器的紧急请求也锁在低并发上。
-      const hurry = options.hurry === true;
-      const rescueReserve = parallel && globalConcurrency >= 8
-        ? Math.min(8, Math.max(1, Math.ceil(globalConcurrency / 8)))
-        : 0;
-      semaphore.setLimit(globalConcurrency, rescueReserve);
-      const basePriority = (Number.isFinite(Number(options.priority)) ? Number(options.priority) : 50)
-        + (hurry ? 180 : 0);
+      semaphore.setLimit(globalConcurrency);
+      const basePriority = Number.isFinite(Number(options.priority)) ? Number(options.priority) : 50;
       const pieceConcurrency = options.startup === true
         ? Math.max(1, Math.min(22, effectiveConcurrency))
-        : hurry
-          ? effectiveConcurrency
-          : Math.max(1, effectiveConcurrency - rescueReserve);
+        : effectiveConcurrency;
       const pieces = core.splitRange(
         range.start,
         range.end,

@@ -2,7 +2,9 @@
 // The download optimizations: resuming a broken piece from its received bytes, spreading
 // pieces over nodes by measured speed, and growing sub-chunks with the measured speed.
 const {test}=require("node:test"),assert=require("node:assert/strict"),fs=require("node:fs"),path=require("node:path"),vm=require("node:vm");
-const SOURCE=fs.existsSync(path.join(__dirname,"../shared/range-core.js"))?path.join(__dirname,"../shared"):path.join(__dirname,"../src");
+const SOURCE=process.env.BTR_TEST_SOURCE
+  ? path.resolve(process.env.BTR_TEST_SOURCE)
+  : fs.existsSync(path.join(__dirname,"../shared/range-core.js"))?path.join(__dirname,"../shared"):path.join(__dirname,"../src");
 function load(){
   const context=vm.createContext({URL,AbortController,DOMException,Response,ReadableStream,Headers,Uint8Array,Promise,setTimeout,clearTimeout,performance,console});
   context.globalThis=context;
@@ -301,7 +303,7 @@ test("the video and the audio track each get their trials, however they take tur
   assert.ok(counts.video>=2&&counts.audio>=2,`both tracks tried their unmeasured node: video ${counts.video}, audio ${counts.audio}`);
 });
 
-test("hurry work gets the reserved rescue connection",{timeout:30000},async()=>{
+test("normal work can use the full configured concurrency",{timeout:30000},async()=>{
   const {idm}=load();
   const HOST="upos-sz-mirrorali.bilivideo.com";
   const only=[mediaUrl(HOST)];
@@ -314,17 +316,14 @@ test("hurry work gets the reserved rescue connection",{timeout:30000},async()=>{
     return ok(start,end,64*1024*1024);
   };
   const downloader=idm.createDownloader({getSettings:()=>({concurrency:8}),nativeFetch});
-  const normal=downloader.downloadRange({start:0,end:7*64*1024-1,length:7*64*1024},resolver,{parallel:true,kind:"video"});
+  const normal=downloader.downloadRange({start:0,end:8*64*1024-1,length:8*64*1024},resolver,{parallel:true,kind:"video"});
   await new Promise(resolve=>setTimeout(resolve,20));
-  assert.equal(requests.length,7,"normal work stops below the rescue reserve");
-  const urgent=downloader.downloadRange({start:8*64*1024,end:9*64*1024-1,length:64*1024},resolver,{parallel:true,kind:"video",hurry:true,deadlineMs:300});
-  await new Promise(resolve=>setTimeout(resolve,20));
-  assert.equal(requests.length,8,"hurry work starts in the reserved slot");
+  assert.equal(requests.length,8,"normal work is not hard-limited below the configured concurrency");
   while(pending.length) pending.shift()();
-  await Promise.all([normal,urgent]);
+  await normal;
 });
 
-test("a near playback deadline shortens the hedge delay",{timeout:30000},async()=>{
+test("a near playback deadline shortens a single-piece hedge delay",{timeout:30000},async()=>{
   const {idm}=load();
   const SLOW="upos-sz-mirrorali.bilivideo.com",FAST="upos-sz-mirrorhw.bilivideo.com";
   const all=[mediaUrl(SLOW),mediaUrl(FAST)],starts=[],transfers=[];
@@ -338,9 +337,58 @@ test("a near playback deadline shortens the hedge delay",{timeout:30000},async()
   const resolver={urls:()=>all,ordered:()=>all,rescueCandidates:()=>all.slice(1),rangeCandidates:()=>all,allows:()=>true,success(){},failure(){},speed:()=>0};
   const downloader=idm.createDownloader({getSettings:()=>({concurrency:8}),nativeFetch,onTransfer:event=>{transfers.push(event);return transfers.length;}});
   const started=Date.now();
-  const result=await downloader.downloadRange({start:0,end:128*1024-1,length:128*1024},resolver,{parallel:true,kind:"video",hurry:true,deadlineMs:300});
-  assert.equal(result.bytes.length,128*1024);
+  const result=await downloader.downloadRange({start:0,end:64*1024-1,length:64*1024},resolver,{parallel:true,kind:"video",maxConcurrency:1,deadlineMs:300});
+  assert.equal(result.bytes.length,64*1024);
   const fast=starts.find(item=>item.host===FAST);
-  assert.ok(fast && fast.at-started<500,`hedge started before deadline: ${fast?.at-started}ms`);
+  assert.ok(fast && fast.at-started<300,`hedge started before deadline: ${fast?.at-started}ms`);
   assert.ok(transfers.some(event=>event.phase==="progress" && Number.isFinite(event.etaMs) && event.receivedBytes>0),"progress carries per-request ETA");
+});
+
+test("an expired deadline starts the hedge immediately",{timeout:30000},async()=>{
+  const {idm}=load();
+  const SLOW="upos-sz-mirrorali.bilivideo.com",FAST="upos-sz-mirrorhw.bilivideo.com";
+  const all=[mediaUrl(SLOW),mediaUrl(FAST)],starts=[];
+  const nativeFetch=async(url,init)=>{
+    const host=new URL(url).hostname, range=rangeOf(init);
+    starts.push({host,at:Date.now()});
+    if(host===SLOW) await new Promise(resolve=>setTimeout(resolve,1000));
+    return ok(range.start,range.end,64*1024*1024);
+  };
+  const resolver={urls:()=>all,ordered:()=>all,rescueCandidates:()=>all.slice(1),rangeCandidates:()=>all,allows:()=>true,success(){},failure(){},speed:()=>0};
+  const downloader=idm.createDownloader({getSettings:()=>({concurrency:8}),nativeFetch});
+  const started=Date.now();
+  await downloader.downloadRange({start:0,end:64*1024-1,length:64*1024},resolver,{parallel:true,kind:"video",maxConcurrency:1,deadlineMs:0});
+  const fast=starts.find(item=>item.host===FAST);
+  assert.ok(fast && fast.at-started<150,`expired deadline hedges immediately: ${fast?.at-started}ms`);
+});
+
+test("queued pieces follow playback deadline instead of enqueue order",{timeout:30000},async()=>{
+  const {idm}=load();
+  const HOST="upos-sz-mirrorali.bilivideo.com",only=[mediaUrl(HOST)];
+  const pending=[],requests=[];
+  const nativeFetch=async(url,init)=>{
+    const range=rangeOf(init);
+    requests.push({start:range.start,at:Date.now()});
+    await new Promise(resolve=>pending.push({resolve,start:range.start,end:range.end}));
+    return ok(range.start,range.end,128*1024*1024);
+  };
+  const resolver={urls:()=>only,ordered:()=>only,rescueCandidates:()=>only,rangeCandidates:()=>only,allows:()=>true,success(){},failure(){},speed:()=>0};
+  const downloader=idm.createDownloader({getSettings:()=>({concurrency:4}),nativeFetch});
+  const block=downloader.downloadRange({start:0,end:4*64*1024-1,length:4*64*1024},resolver,{parallel:true,kind:"video",deadlineMs:10000});
+  await new Promise(resolve=>setTimeout(resolve,20));
+  const far=downloader.downloadRange({start:8*64*1024,end:12*64*1024-1,length:4*64*1024},resolver,{parallel:true,kind:"video",deadlineMs:5000});
+  const nearStart=16*64*1024;
+  const near=downloader.downloadRange({start:nearStart,end:20*64*1024-1,length:4*64*1024},resolver,{parallel:true,kind:"video",deadlineMs:0});
+  await new Promise(resolve=>setTimeout(resolve,20));
+  for(const item of pending.splice(0,4)) item.resolve();
+  for(let tick=0; requests.length<8 && tick<100; tick+=1) await new Promise(resolve=>setTimeout(resolve,5));
+  assert.ok(requests.length>=8,"queued work starts after the blocking requests finish");
+  assert.ok(requests.slice(4,8).every(item=>item.start>=nearStart),"expired deadline pieces overtake older queued prefetch");
+  for(let tick=0; requests.length<12 && tick<100; tick+=1) {
+    while(pending.length) pending.shift().resolve();
+    await new Promise(resolve=>setTimeout(resolve,5));
+  }
+  while(pending.length) pending.shift().resolve();
+  assert.equal(requests.length,12,"all queued ranges are released");
+  await Promise.all([block,far,near]);
 });

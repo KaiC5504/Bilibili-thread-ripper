@@ -510,11 +510,16 @@
       if (candidate.startupPrefetchLaunched || !sessionIsCurrent(candidate) || !candidate.tracks.length) return;
       if (!candidate.tracks.every((track) => track.startupScheduled)) return;
       candidate.startupPrefetchLaunched = true;
+      const current = Number(video.currentTime) || candidate.startTime;
       for (const track of candidate.tracks) {
         const index = track.startupIndex + 1;
         track.followupScheduled = true;
         const segment = track.sidx.segments[index];
-        if (segment) track.prefetches.set(index, segmentDownload(candidate, track, segment, index, { priority: 70, hurry: true }));
+        if (segment) track.prefetches.set(index, segmentDownload(candidate, track, segment, index, {
+          priority: 70,
+          hurry: true,
+          deadlineMs: Math.max(0, (segment.startTime - current) * 1000)
+        }));
       }
       ensureBuffer(candidate);
     }
