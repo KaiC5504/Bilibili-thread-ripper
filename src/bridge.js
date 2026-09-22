@@ -149,7 +149,7 @@
     autoInput.name = "btr-onboarding-auto";
     autoInput.checked = latestSettings.autoConcurrency !== false;
     const autoText = document.createElement("span");
-    autoText.textContent = "自动线程数（推荐）：从 8 条开始，一发现播放跟不上就加到最多 32 条";
+    autoText.textContent = "自动线程数（推荐）：BTR将智能选择需要的线程数。";
     autoRow.append(autoInput, autoText);
     const threadHead = document.createElement("div");
     threadHead.className = "btr-onboarding-thread-head";

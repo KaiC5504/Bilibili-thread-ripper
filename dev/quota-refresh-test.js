@@ -10,6 +10,11 @@
   let removals = [];
   let quotaThrows = 0;
   let buffers = [];
+  // A write of this segment number stays in progress until released (see heldWrite).
+  let heldWrite = null;
+  let aborts = [];
+  let endOfStreamCalls = 0;
+  let lastMediaSource = null;
   // What the next fake buffers are made of; each scenario sets it before creating its player.
   let bufferSetup = null;
 
@@ -76,6 +81,16 @@
         throw new DOMException("quota exceeded", "QuotaExceededError");
       }
       if (media) this.appended.push(mark - 1000);
+      if (lastMediaSource?.readyState === "ended") lastMediaSource.readyState = "open";
+      if (media && heldWrite && heldWrite.kind === this.kind && heldWrite.segment === mark - 1000) {
+        this.updating = true;
+        heldWrite.release = () => this.finish(() => {
+          const last = this.ranges.at(-1);
+          if (last) last[1] += SEGMENT_SECONDS;
+          else this.ranges.push([clock, clock + SEGMENT_SECONDS]);
+        });
+        return;
+      }
       this.finish(() => {
         if (!media) return;
         const last = this.ranges.at(-1);
@@ -83,6 +98,8 @@
         else this.ranges.push([clock, clock + SEGMENT_SECONDS]);
       });
     }
+
+    abort() { aborts.push({ kind: this.kind, updating: this.updating, appended: this.appended.length }); }
 
     remove(start, end) {
       if (this.updating) throw new DOMException("still updating", "InvalidStateError");
@@ -104,8 +121,8 @@
       }, 0);
     }
 
-    addSourceBuffer(type) { return new FakeSourceBuffer(type.startsWith("audio") ? "audio" : "video"); }
-    endOfStream() { this.readyState = "ended"; }
+    addSourceBuffer(type) { lastMediaSource = this; return new FakeSourceBuffer(type.startsWith("audio") ? "audio" : "video"); }
+    endOfStream() { endOfStreamCalls += 1; this.readyState = "ended"; }
   };
 
   root.__BILI_SIDX__ = {
@@ -321,8 +338,9 @@
     await sleep(100);
     const deadlines = [...new Set(downloadedUrls.slice(from).map((item) => Number(new URL(item.url).searchParams.get("deadline"))))];
     const reported = player.urlDeadlineSeconds();
-    // A drag far outside the buffer starts a new session. It must not pick the older
-    // addresses up again from the playinfo that was turned away.
+    // A drag far outside the buffer moves both tracks to the new position inside the running
+    // session. It must not pick the older addresses up again from the playinfo that was
+    // turned away, and it must not rebuild the session (which would reset the element).
     const sessions = player.getDebug().sessionStarts;
     const afterSeek = downloadedUrls.length;
     bufferSetup = { video: { ranges: [] }, audio: { ranges: [] } };
@@ -331,8 +349,8 @@
     for (const buffer of buffers) Object.defineProperty(buffer, "buffered", { get: () => ({ length: 0, start() { throw new RangeError("empty"); }, end() { throw new RangeError("empty"); } }) });
     clock = 100;
     video.dispatchEvent(new Event("seeking"));
-    const restarted = await until(() => player.getDebug().sessionStarts > sessions
-      && ["video", "audio"].every((kind) => downloadedUrls.slice(afterSeek).some((item) => item.kind === kind)), 6000);
+    const restarted = await until(() => ["video", "audio"].every((kind) => downloadedUrls.slice(afterSeek).some((item) => item.kind === kind)), 6000)
+      && player.getDebug().sessionStarts === sessions;
     await sleep(200);
     const afterSeekDeadlines = [...new Set(downloadedUrls.slice(afterSeek).map((item) => Number(new URL(item.url).searchParams.get("deadline"))))];
     player.destroy({ resumeNative: false });
@@ -368,12 +386,19 @@
   }
 
   // Bilibili's core seeks back to a position it saved when it last reloaded its own source
-  // whenever the element reports new metadata, which every BTR session does. After BTR once
-  // handed the video back at 30 s, a drag to 90 s must not end up at 30 s again; a real drag
-  // right after must still count; and a seek that matches no saved position is left alone.
+  // whenever the element reports new metadata. A drag no longer rebuilds the session, so it
+  // gives the core no such moment; a quality switch still does. After BTR once handed the
+  // video back at 30 s: a drag to 90 s stays in the session and stays at 90 s; a quality
+  // switch there must not end up at 30 s either; a real drag right after still counts; and a
+  // seek that matches no saved position is left alone.
   async function nativeRestoreAfterSeek() {
     const errors = [];
     const logs = [];
+    const twoQualities = { data: { dash: {
+      duration: SEGMENT_COUNT * SEGMENT_SECONDS,
+      video: [representation(80, "video/mp4", "avc1.640028", 2000000, 1000), { ...representation(64, "video/mp4", "avc1.640028", 1000000, 1000), height: 720 }],
+      audio: [representation(30280, "audio/mp4", "mp4a.40.2", 128000, 1000)]
+    } } };
     video.setAttribute("src", `${location.origin}/native-source`);
     // A first takeover that hands the video back at 30 s: Bilibili's core saves that position.
     const first = startPlayer(30, {}, errors, logs);
@@ -381,11 +406,20 @@
     first.destroy({ resumeNative: true });
     // The retake, as page-hook does it a few seconds later.
     const player = startPlayer(30, {}, errors, logs);
+    await player.updatePlayinfo(twoQualities);
     await until(() => downloadedUrls.filter((item) => item.kind === "video").length >= 2, 6000);
     const sessions = player.getDebug().sessionStarts;
-    const drag = async (seconds) => { clock = seconds; video.dispatchEvent(new Event("seeking")); const before = player.getDebug().sessionStarts; return until(() => player.getDebug().sessionStarts > before, 3000); };
-    // The viewer drags to 90 s; the new session reports metadata and the core puts 30 s back.
-    const restarted = await drag(90);
+    // The viewer drags to 90 s: the tracks move inside the running session.
+    for (const buffer of buffers) Object.defineProperty(buffer, "buffered", { get: () => ({ length: 0, start() { throw new RangeError("empty"); }, end() { throw new RangeError("empty"); } }) });
+    clock = 90;
+    video.dispatchEvent(new Event("seeking"));
+    await sleep(400);
+    const draggedAt = clock;
+    const keptSession = player.getDebug().sessionStarts === sessions;
+    // A quality switch there opens a new session; its metadata and the core puts 30 s back.
+    bufferSetup = { video: { ranges: [] }, audio: { ranges: [] } };
+    await player.setQuality(64);
+    const restarted = await until(() => player.getDebug().sessionStarts > sessions, 3000);
     video.dispatchEvent(new Event("loadedmetadata"));
     clock = 30;
     video.dispatchEvent(new Event("seeking"));
@@ -394,9 +428,7 @@
     const undone = player.getDebug().nativeRestoresUndone;
     const sessionsAfterUndo = player.getDebug().sessionStarts;
     // A real drag right after the restore was undone still counts, even back to the very
-    // position the core restored and inside the window in which a restore is undone (the
-    // session is still loading, so it moves that session's start instead of opening another
-    // one).
+    // position the core restored and inside the window in which a restore is undone.
     clock = 30; video.dispatchEvent(new Event("seeking"));
     await sleep(400);
     const secondAt = clock;
@@ -404,17 +436,80 @@
     await until(() => player.getDebug().playbackActivated, 6000);
     // A seek right after metadata that matches no saved position is a viewer's seek.
     video.dispatchEvent(new Event("loadedmetadata"));
-    const thirdDrag = await drag(100);
-    await sleep(200);
+    clock = 100;
+    video.dispatchEvent(new Event("seeking"));
+    await sleep(400);
     const thirdAt = clock;
     const finalUndone = player.getDebug().nativeRestoresUndone;
     player.destroy({ resumeNative: false });
     video.removeAttribute("src");
     return {
-      errors, restarted, heldAt, undone, sessionsAfterUndo, secondDrag, secondAt, thirdDrag, thirdAt, finalUndone, logs: logs.filter((title) => /回跳/.test(title)),
-      pass: !errors.length && restarted && heldAt === 90 && undone === 1 && sessionsAfterUndo === sessions + 1
-        && secondDrag && thirdDrag && thirdAt === 100 && finalUndone === 1
+      errors, draggedAt, keptSession, restarted, heldAt, undone, sessionsAfterUndo, secondDrag, secondAt, thirdAt, finalUndone, logs: logs.filter((title) => /回跳/.test(title)),
+      pass: !errors.length && draggedAt === 90 && keptSession && restarted && heldAt === 90 && undone === 1
+        && sessionsAfterUndo === sessions + 1 && secondDrag && thirdAt === 100 && finalUndone === 1
     };
+  }
+
+  // A drag inside the session while the buffer may hold half a segment: before the new
+  // position's first write, every buffer's parser is reset, after the write in progress.
+  async function seekResetsHalfWrittenSegment() {
+    const errors = [];
+    const player = startPlayer(30, {}, errors);
+    await until(() => buffers.length === 2 && buffers.every((buffer) => buffer.appended.length >= 1), 6000);
+    for (const buffer of buffers) Object.defineProperty(buffer, "buffered", { get: () => ({ length: 0, start() { throw new RangeError("empty"); }, end() { throw new RangeError("empty"); } }) });
+    aborts = [];
+    const before = buffers.map((buffer) => buffer.appended.length);
+    const sessions = player.getDebug().sessionStarts;
+    // Seek backwards: old-position prefetches can reach a forward target during the seek
+    // debounce, but cannot append this earlier segment before the new generation starts.
+    clock = 10;
+    video.dispatchEvent(new Event("seeking"));
+    const moved = await until(() => buffers.every((buffer) => buffer.appended.some((segment) => segment === 5)), 6000);
+    const resetFirst = ["video", "audio"].every((kind) => {
+      const abort = aborts.find((item) => item.kind === kind);
+      const buffer = buffers.find((item) => item.kind === kind);
+      const firstNew = buffer.appended.findIndex((segment, index) => index >= before[buffers.indexOf(buffer)] && segment === 5);
+      return abort && !abort.updating && abort.appended <= firstNew;
+    });
+    const keptSession = player.getDebug().sessionStarts === sessions;
+    player.destroy({ resumeNative: false });
+    return { errors, moved, resetFirst, keptSession, aborts: aborts.length, pass: !errors.length && moved && resetFirst && keptSession };
+  }
+
+  // A drag while the old position's last audio write is still in progress. The audio buffer
+  // already holds the new position, so the audio side has nothing of its own to write when
+  // that old write lands and nothing would correct a wrong position. Once playback wants
+  // more, the audio must still come from the new position, and the stream must not end.
+  async function lateWriteAfterSeek() {
+    const errors = [];
+    endOfStreamCalls = 0;
+    heldWrite = { kind: "audio", segment: SEGMENT_COUNT - 1, release: null };
+    const player = startPlayer(110, {}, errors);
+    const held = await until(() => typeof heldWrite.release === "function", 8000);
+    const sessions = player.getDebug().sessionStarts;
+    // What each buffer reports from here on is set by the test.
+    const reported = { video: [], audio: [[29, 120]] };
+    for (const buffer of buffers) Object.defineProperty(buffer, "buffered", { get: () => { const list = reported[buffer.kind]; return { length: list.length, start: (i) => list[i][0], end: (i) => list[i][1] }; } });
+    const from = downloadedUrls.length;
+    clock = 30;
+    video.dispatchEvent(new Event("seeking"));
+    const videoMoved = await until(() => downloadedUrls.slice(from).some((item) => item.kind === "video" && item.segment >= 15 && item.segment < 30), 6000);
+    await sleep(300);
+    // Now the old position's audio write lands.
+    heldWrite.release();
+    heldWrite = null;
+    await sleep(300);
+    // Playback moves on and wants more audio than is buffered.
+    const beforeMore = downloadedUrls.length;
+    reported.audio = [[29, 44]];
+    clock = 40;
+    video.dispatchEvent(new Event("timeupdate"));
+    const audioContinued = await until(() => downloadedUrls.slice(beforeMore).some((item) => item.kind === "audio" && item.segment >= 15 && item.segment < 40), 3000);
+    await sleep(200);
+    const notEnded = endOfStreamCalls === 0;
+    const keptSession = player.getDebug().sessionStarts === sessions;
+    player.destroy({ resumeNative: false });
+    return { errors, held, videoMoved, audioContinued, notEnded, endOfStreamCalls, keptSession, pass: !errors.length && held && videoMoved && audioContinued && notEnded && keptSession };
   }
 
   // Bilibili's page answers first, then the timed refresh runs twice. After every one of them
@@ -454,7 +549,7 @@
   root.__runQuotaRefreshTest = async function runQuotaRefreshTest() {
     const result = document.getElementById("quota-refresh-result");
     const output = {};
-    for (const [name, scenario] of Object.entries({ scriptedQuota, fullBufferWaits, fullBufferWithNothingAhead, heldSegmentDiesWithItsSession, recoveryUnderALoweredLimit, aStallThatMeetsAFullBufferFails, repeatedRefresh, olderAnswerKeepsNewerAddresses, olderAddressOfAnotherQuality, nativeRestoreAfterSeek })) {
+    for (const [name, scenario] of Object.entries({ scriptedQuota, fullBufferWaits, fullBufferWithNothingAhead, heldSegmentDiesWithItsSession, recoveryUnderALoweredLimit, aStallThatMeetsAFullBufferFails, repeatedRefresh, olderAnswerKeepsNewerAddresses, olderAddressOfAnotherQuality, nativeRestoreAfterSeek, seekResetsHalfWrittenSegment, lateWriteAfterSeek })) {
       try { output[name] = await scenario(); }
       catch (error) { output[name] = { pass: false, crashed: String(error?.stack || error) }; }
     }

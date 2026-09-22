@@ -34,6 +34,44 @@
       const second = mediaSource.addSourceBuffer('video/mp4; codecs="avc1.640028"');
       output.checks.healthyBufferUntouched = second.buffered.length === 0;
 
+      // Bilibili's idle core throws on every drag (its seek handler reads DVRWindow off a
+      // representation it never filled). While a takeover is active those are kept out of the
+      // page; anything else, and the same error without a takeover, still reports.
+      const seen = [];
+      window.addEventListener("error", (event) => seen.push(event.message));
+      const leftover = () => new ErrorEvent("error", {
+        message: "Uncaught TypeError: Cannot read properties of undefined (reading 'DVRWindow')",
+        filename: "https://s1.hdslb.com/bfs/static/player/main/core.ba67b466.js", cancelable: true
+      });
+      const unrelated = () => new ErrorEvent("error", {
+        message: "Uncaught TypeError: something else entirely",
+        filename: "https://s1.hdslb.com/bfs/static/player/main/core.ba67b466.js", cancelable: true
+      });
+      const ourOwn = () => new ErrorEvent("error", {
+        message: "Uncaught TypeError: Cannot read properties of undefined (reading 'DVRWindow')",
+        filename: "https://example.com/other.js", cancelable: true
+      });
+      const container = document.querySelector(".bpx-player-container");
+      container.dataset.btrMseActive = "true";
+      const suppressed = leftover();
+      window.dispatchEvent(suppressed);
+      output.checks.leftoverSuppressed = suppressed.defaultPrevented && !seen.includes(suppressed.message);
+      const other = unrelated();
+      window.dispatchEvent(other);
+      output.checks.unrelatedErrorKept = !other.defaultPrevented && seen.includes(other.message);
+      const foreign = ourOwn();
+      window.dispatchEvent(foreign);
+      output.checks.otherSourceKept = !foreign.defaultPrevented;
+      const lookalike = new ErrorEvent("error", {
+        message: "Uncaught TypeError: Cannot read properties of undefined (reading 'DVRWindow')",
+        filename: "https://example.com/hdslb.com/player/core.js", cancelable: true
+      });
+      window.dispatchEvent(lookalike);
+      output.checks.lookalikeSourceKept = !lookalike.defaultPrevented;
+      delete container.dataset.btrMseActive;
+      const withoutTakeover = leftover();
+      window.dispatchEvent(withoutTakeover);
+      output.checks.keptWithoutTakeover = !withoutTakeover.defaultPrevented;
       output.pass = Object.values(output.checks).every(Boolean);
     } catch (error) {
       output.error = String(error?.stack || error);

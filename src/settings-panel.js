@@ -63,7 +63,7 @@
           <output id="thread-value" for="concurrency">8</output>
         </div>
         <div class="auto-row">
-          <label for="auto-concurrency">自动线程数<small>从 8 条开始，播放一跟不上就加到最多 32 条</small></label>
+          <label for="auto-concurrency">自动线程数<small>BTR将智能选择需要的线程数。</small></label>
           <label class="switch"><input id="auto-concurrency" type="checkbox" aria-label="自动线程数"><span></span></label>
         </div>
         <div class="slider">
