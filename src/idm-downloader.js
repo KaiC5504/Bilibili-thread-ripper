@@ -36,6 +36,19 @@
 
     drainQueue() {
       while (this.active < this.limit && this.queue.length) {
+        const now = performance.now();
+        const urgency = entry => {
+          if (!Number.isFinite(entry.deadlineAt)) return 0;
+          const remaining = entry.deadlineAt - now;
+          if (remaining <= 0) return 12;
+          if (remaining <= 750) return 9;
+          if (remaining <= 2000) return 6;
+          return 0;
+        };
+        // A bounded, recomputed boost prevents overdue primaries from sitting behind
+        // prefetch work without turning the queue back into strict deadline ordering.
+        this.queue.sort((a, b) => (b.priority + urgency(b)) - (a.priority + urgency(a))
+          || a.sequence - b.sequence);
         const entry = this.queue.shift();
         entry.signal?.removeEventListener("abort", entry.cancel);
         if (entry.signal?.aborted) {
@@ -52,7 +65,7 @@
       }
     }
 
-    acquire(signal, priority = 0) {
+    acquire(signal, priority = 0, deadlineAt = Infinity) {
       if (signal?.aborted) return Promise.reject(abortError(signal.reason));
       return new Promise((resolve, reject) => {
         const entry = {
@@ -61,6 +74,7 @@
           signal,
           released: false,
           priority: Number(priority) || 0,
+          deadlineAt: Number.isFinite(deadlineAt) ? deadlineAt : Infinity,
           sequence: this.sequence++
         };
         entry.cancel = () => {
@@ -72,7 +86,6 @@
         };
         signal?.addEventListener("abort", entry.cancel, { once: true });
         this.queue.push(entry);
-        this.queue.sort((a, b) => b.priority - a.priority || a.sequence - b.sequence);
         this.drain();
         this.onChange?.(this.active, this.limit, this.queue.length);
       });
@@ -414,7 +427,7 @@
     async function attempt(piece, url, signal, kind, resolver, priority = 0, begin = null,
       deadlineAt = Infinity, observeProgress = null) {
       const settings = config();
-      const release = await semaphore.acquire(signal, priority);
+      const release = await semaphore.acquire(signal, priority, deadlineAt);
       let received = { bytes: 0, chunks: [] };
       if (begin) {
         try {
@@ -603,7 +616,7 @@
           const firstFailure = new Promise((resolve) => { firstFailed = resolve; });
           let firstStarted = () => {};
           const firstStart = new Promise((resolve) => { firstStarted = resolve; });
-          let firstStartedAt = 0, firstBecameStraggler = () => {};
+          let firstStartedAt = 0, deadlineDeficitSamples = 0, firstBecameStraggler = () => {};
           const firstStraggler = new Promise((resolve) => { firstBecameStraggler = resolve; });
           const observeFirst = event => {
             if (event.phase !== "progress" || !Number.isFinite(event.etaMs)) return;
@@ -611,7 +624,17 @@
               && event.etaMs >= Math.max(0, deadlineAt - performance.now());
             const slowerThanPeers = meter.connectionBps > 0 && event.bps < meter.connectionBps * 0.5
               && event.etaMs >= 500;
-            if (Number.isFinite(deadlineAt) && missesDeadline && slowerThanPeers) firstBecameStraggler();
+            const remainingToDeadline = deadlineAt - performance.now();
+            deadlineDeficitSamples = Number.isFinite(deadlineAt)
+              && event.etaMs - remainingToDeadline >= 250
+              ? deadlineDeficitSamples + 1
+              : 0;
+            // A clearly slow node is rescued immediately. If the whole route is slow,
+            // two consecutive deficit samples may spend the same one-per-range budget.
+            if (Number.isFinite(deadlineAt)
+              && ((missesDeadline && slowerThanPeers) || deadlineDeficitSamples >= 2)) {
+              firstBecameStraggler();
+            }
           };
           const contexts = [];
           const attempts = pair.map((url, pairIndex) => (async () => {
@@ -627,7 +650,7 @@
               const startTimer = () => {
                 const measured = hedgeDelayMs(settings);
                 const delay = probe ? 0 : startup
-                  ? Math.min(250, measured)
+                  ? Math.min(Number.isFinite(deadlineAt) ? 200 : 250, measured)
                   : measured;
                 timer = setTimeout(() => finish(resolve), delay);
               };
