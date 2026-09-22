@@ -11,7 +11,7 @@
   const ONBOARDING_STORAGE_KEY = "btrOnboardingRevision";
   const ONBOARDING_REVISION = "native-progressive-mse-v1";
   const THREAD_OPTIONS = Object.freeze([4, 8, 16, 32, 64, 128]);
-  const DEFAULTS = { enabled: true, liveEnabled: true, concurrency: 8, takeover: "full", mode: "mainland", customHosts: [], debugNotices: false, errorNotices: false, debugCategories: {} };
+  const DEFAULTS = { enabled: true, liveEnabled: true, concurrency: 8, autoConcurrency: true, takeover: "full", mode: "mainland", customHosts: [], debugNotices: false, errorNotices: false, debugCategories: {} };
   // Settings of the old ArtPlayer version and of the removed compatibility modes.
   const RETIRED_KEYS = ["statusNotice", "compatibilityMode", "volume", "danmaku", "danmakuFontSize", "subtitleLanguage", "subtitleLastLanguage"];
   let latestSettings = { ...DEFAULTS };
@@ -58,6 +58,9 @@
       #${ONBOARDING_ID} .btr-onboarding-thread-head{display:flex!important;align-items:center!important;justify-content:space-between!important;margin:0 0 6px!important}
       #${ONBOARDING_ID} .btr-onboarding-thread-value{color:#fb7299!important;font-size:22px!important;line-height:28px!important;font-weight:700!important;font-variant-numeric:tabular-nums!important}
       #${ONBOARDING_ID} input[type="range"]{display:block!important;width:100%!important;height:24px!important;margin:0!important;accent-color:#fb7299!important;cursor:pointer!important}
+      #${ONBOARDING_ID} .btr-onboarding-auto{display:flex!important;align-items:flex-start!important;gap:8px!important;margin:0 0 12px!important;color:#18191c!important;font-size:13px!important;line-height:18px!important;cursor:pointer!important}
+      #${ONBOARDING_ID} .btr-onboarding-auto input{margin:2px 0 0!important;accent-color:#fb7299!important}
+      #${ONBOARDING_ID} .btr-onboarding-auto-on input[type=range],#${ONBOARDING_ID} .btr-onboarding-auto-on .btr-onboarding-ticks,#${ONBOARDING_ID} .btr-onboarding-auto-on .btr-onboarding-thread-head{opacity:.45!important}
       #${ONBOARDING_ID} .btr-onboarding-ticks{display:flex!important;justify-content:space-between!important;margin-top:2px!important;color:#9499a0!important;font-size:11px!important;line-height:16px!important}
       #${ONBOARDING_ID} .btr-onboarding-tip{margin:0 0 18px!important;padding:10px 12px!important;border-radius:7px!important;background:#f6f7f8!important;color:#61666d!important;font-size:12px!important;line-height:18px!important}
       #${ONBOARDING_ID} .btr-onboarding-save{display:block!important;width:100%!important;height:42px!important;margin:0!important;border:0!important;border-radius:8px!important;background:#fb7299!important;color:#fff!important;font:600 14px/42px "Microsoft YaHei","PingFang SC",Arial,sans-serif!important;text-align:center!important;cursor:pointer!important}
@@ -134,11 +137,20 @@
     takeoverHint.className = "btr-onboarding-hint";
     takeoverHint.textContent = "Safari 用户建议使用兼容模式。以后可以在设置面板里随时改。";
     takeoverFieldset.append(takeoverLegend, cardList("btr-onboarding-takeover", [
-      { value: "full", name: "全接管（推荐）", note: "视频由插件自己来放，什么时候下、下多少都由插件安排，效果最好" },
-      { value: "compat", name: "兼容模式", note: "还是 B 站自己的播放器在放，插件只帮它多线程下载，换清晰度交给 B 站，更不容易出问题" }
+      { value: "full", name: "全接管（推荐）", note: "视频由插件自己来放，下载和缓冲都由插件安排，速度最快" },
+      { value: "compat", name: "兼容模式", note: "当遇到播放问题或设置不生效时，尝试使用兼容模式" }
     ], latestSettings.takeover), takeoverHint);
 
     const threadFieldset = document.createElement("fieldset");
+    const autoRow = document.createElement("label");
+    autoRow.className = "btr-onboarding-auto";
+    const autoInput = document.createElement("input");
+    autoInput.type = "checkbox";
+    autoInput.name = "btr-onboarding-auto";
+    autoInput.checked = latestSettings.autoConcurrency !== false;
+    const autoText = document.createElement("span");
+    autoText.textContent = "自动线程数（推荐）：从 8 条开始，一发现播放跟不上就加到最多 32 条";
+    autoRow.append(autoInput, autoText);
     const threadHead = document.createElement("div");
     threadHead.className = "btr-onboarding-thread-head";
     const threadLegend = document.createElement("legend");
@@ -168,11 +180,14 @@
       tick.textContent = String(value);
       ticks.append(tick);
     }
-    threadFieldset.append(threadHead, threadRange, ticks);
+    const syncAuto = () => { threadRange.disabled = autoInput.checked; threadFieldset.classList.toggle("btr-onboarding-auto-on", autoInput.checked); };
+    autoInput.addEventListener("change", syncAuto);
+    syncAuto();
+    threadFieldset.append(autoRow, threadHead, threadRange, ticks);
 
     const tip = document.createElement("p");
     tip.className = "btr-onboarding-tip";
-    tip.textContent = "推荐大陆 CDN，线程数推荐 8 到 32，可以先从 8 开始，不够流畅再往上加。以后可在 B 站播放器的 ⚙ 设置中随时修改。";
+    tip.textContent = "推荐大陆 CDN。线程数自动调整时不用管；想固定线程数就关掉自动，8 到 32 之间按需选。以后可在 B 站播放器的 ⚙ 设置中随时修改。";
     const save = document.createElement("button");
     save.type = "button";
     save.className = "btr-onboarding-save";
@@ -184,10 +199,11 @@
       const mode = panel.querySelector('input[name="btr-onboarding-mode"]:checked')?.value === "overseas" ? "overseas" : "mainland";
       const takeover = panel.querySelector('input[name="btr-onboarding-takeover"]:checked')?.value === "compat" ? "compat" : "full";
       const concurrency = THREAD_OPTIONS[Number(threadRange.value)] || 8;
+      const autoConcurrency = autoInput.checked;
       save.disabled = true;
       save.textContent = "正在保存…";
-      latestSettings = normalizeStoredSettings({ ...latestSettings, enabled: true, mode, takeover, concurrency });
-      chrome.storage.sync.set({ enabled: true, mode, takeover, concurrency }, () => {
+      latestSettings = normalizeStoredSettings({ ...latestSettings, enabled: true, mode, takeover, concurrency, autoConcurrency });
+      chrome.storage.sync.set({ enabled: true, mode, takeover, concurrency, autoConcurrency }, () => {
         if (chrome.runtime.lastError) {
           status.textContent = `保存失败：${chrome.runtime.lastError.message}`;
           save.disabled = false;
@@ -231,7 +247,9 @@
     const threads = Math.trunc(Number(input?.concurrency));
     return {
       enabled: input?.enabled !== false,
+      liveEnabled: input?.liveEnabled !== false,
       concurrency: THREAD_OPTIONS.includes(threads) ? threads : 8,
+      autoConcurrency: input?.autoConcurrency !== false,
       takeover: input?.takeover === "compat" ? "compat" : "full",
       mode: ["overseas", "custom"].includes(input?.mode) ? input.mode : "mainland",
       customHosts: (Array.isArray(input?.customHosts) ? input.customHosts : [])

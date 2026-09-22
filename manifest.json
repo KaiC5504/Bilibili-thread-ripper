@@ -52,6 +52,7 @@
       ],
       "js": [
         "src/range-core.js",
+        "src/cdn-resolver.js",
         "src/live-core.js",
         "src/runtime-notices.js",
         "src/settings-panel.js",
@@ -59,6 +60,23 @@
       ],
       "run_at": "document_start",
       "all_frames": true,
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "https://*.bilibili.com/*"
+      ],
+      "exclude_matches": [
+        "https://www.bilibili.com/*",
+        "https://m.bilibili.com/*",
+        "https://live.bilibili.com/*"
+      ],
+      "js": [
+        "src/range-core.js",
+        "src/cdn-resolver.js",
+        "src/settings-panel.js"
+      ],
+      "run_at": "document_start",
       "world": "MAIN"
     },
     {

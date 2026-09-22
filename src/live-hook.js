@@ -26,14 +26,24 @@
 
   let settings = rangeCore.normalizeSettings({});
   let settingsLoaded = false;
-  const liveOn = () => settings.enabled && settings.liveEnabled !== false;
+  // Off until the saved settings have arrived: a viewer who switched the module off must
+  // not be taken over during the first second of the page.
+  const liveOn = () => settingsLoaded && settings.enabled && settings.liveEnabled !== false;
 
   // Bilibili's web player loads P2P SDKs that pull pieces from other viewers over WebRTC.
   // Overseas there are few viewers nearby, so P2P only adds stalls; the mocks keep the
   // player on the HTTP path. (Approach proven by Make-Bilibili-Great-Than-Ever-Before.)
+  // The page's own SDK is kept and handed out whenever the module is off.
   class MockPcdn { on() {} off() {} emit() {} destroy() {} }
   for (const name of ["PCDNLoader", "BPP2PSDK", "SeederSDK"]) {
-    try { Object.defineProperty(root, name, { value: MockPcdn, writable: false }); } catch (_error) {}
+    let real = root[name];
+    try {
+      Object.defineProperty(root, name, {
+        configurable: true,
+        get() { return liveOn() ? MockPcdn : real; },
+        set(value) { real = value; }
+      });
+    } catch (_error) {}
   }
 
   // ---- stats for the extension badge and the settings panel ----
@@ -82,8 +92,18 @@
   // ---- one live stream: the playlist currently being played ----
   // context: { key, playlistUrl, pool, cache: Map(url -> {promise, at, hit}), lastNum, mapUrl, probing }
   let context = null;
+  // The stream the player asked for most recently. A playlist answer that arrives late,
+  // after the player moved on to another stream, must not bring the old one back.
+  let latestPlaylistKey = "";
 
   const swapHost = (url, host) => { const u = new URL(url); u.hostname = host; u.port = ""; return u.href; };
+  // Everything of a stream stops with it: queued prefetches, running downloads, probes.
+  function dropContext() {
+    if (!context) return;
+    context.prefetchQueue.length = 0;
+    context.abort.abort(new DOMException("直播已切换或加速已关闭", "AbortError"));
+    context = null;
+  }
   const directoryOf = (url) => { try { const u = new URL(url); return u.pathname.slice(0, u.pathname.lastIndexOf("/") + 1); } catch (_error) { return ""; } };
 
   function contextFor(playlistUrl) {
@@ -92,14 +112,18 @@
       context.playlistUrl = playlistUrl;
       return context;
     }
+    dropContext();
     const pool = core.createHostPool({
       onBan(host) { notices?.log("已停用一个直播节点", `${host} 两次没有返回数据，这个直播接下来不再使用它。`, "error", "", "live", "download"); }
     });
     let origin = "";
     try { origin = new URL(playlistUrl).hostname; } catch (_error) {}
-    if (origin) pool.add(origin, true);
-    for (const host of core.KNOWN_FMP4_HOSTS) if (host !== origin) pool.add(host, false);
-    context = { key, playlistUrl, pool, cache: new Map(), lastNum: 0, mapUrl: "", probing: false, speculativeMisses: 0, prefetchQueue: [], inflightPrefetch: 0, urgentInflight: 0 };
+    // The node Bilibili handed out is trusted unless it is a P2P relay. In the custom CDN
+    // mode only the servers the viewer picked join it; otherwise the known fMP4 group does.
+    if (origin && !core.isP2pUrl(playlistUrl)) pool.add(origin, true);
+    const extra = settings.mode === "custom" ? settings.customHosts : core.KNOWN_FMP4_HOSTS;
+    for (const host of extra) if (host !== origin) pool.add(host, false);
+    context = { key, playlistUrl, pool, cache: new Map(), lastNum: 0, mapUrl: "", probing: false, speculativeMisses: 0, prefetchQueue: [], inflightPrefetch: 0, urgentInflight: 0, abort: new AbortController() };
     stats.playerState = "ready";
     notices?.log("已接管这个直播", "直播分片改为多节点竞速下载，并提前缓存即将播放的分片。", "success", "", "live", "takeover");
     schedulePublish();
@@ -116,13 +140,24 @@
     Promise.allSettled(unproven.map(async (host) => {
       const startedAt = performance.now();
       try {
-        const response = await nativeFetch(swapHost(sampleUrl, host), {
-          headers: { Range: "bytes=0-2047" },
-          credentials: "omit",
-          cache: "no-store",
-          signal: AbortSignal.timeout(4000)
-        });
-        const body = new Uint8Array(await response.arrayBuffer());
+        const probe = new AbortController();
+        const probeTimer = setTimeout(() => probe.abort(new DOMException("直播节点探测超时", "TimeoutError")), 4000);
+        const dropProbe = () => probe.abort(ctx.abort.signal.reason);
+        ctx.abort.signal.addEventListener("abort", dropProbe, { once: true });
+        let response;
+        let body;
+        try {
+          response = await nativeFetch(swapHost(sampleUrl, host), {
+            headers: { Range: "bytes=0-2047" },
+            credentials: "omit",
+            cache: "no-store",
+            signal: probe.signal
+          });
+          body = new Uint8Array(await response.arrayBuffer());
+        } finally {
+          clearTimeout(probeTimer);
+          ctx.abort.signal.removeEventListener("abort", dropProbe);
+        }
         if ((response.status === 206 || response.status === 200) && body.byteLength > 0) {
           ctx.pool.success(host, performance.now() - startedAt, 0);
         } else {
@@ -152,11 +187,16 @@
       if (response.status !== 200 && response.status !== 206) {
         throw Object.assign(new Error(`直播分片响应异常：HTTP ${response.status}`), { status: response.status });
       }
+      // Nothing here asks for a range, so a 206 is only acceptable when it covers the file.
+      const contentRange = rangeCore.parseContentRange(response.headers.get("content-range"));
+      if (response.status === 206 && (!contentRange || contentRange.start !== 0 || contentRange.total === null || contentRange.end !== contentRange.total - 1)) {
+        throw new Error("直播分片只返回了一部分");
+      }
       const reader = response.body?.getReader?.();
       const chunks = [];
+      let firstByteMs = 0;
       if (reader) {
         const firstByteTimer = setTimeout(() => reader.cancel(new DOMException("直播分片首字节超时", "TimeoutError")).catch(() => {}), FIRST_BYTE_TIMEOUT_MS);
-        let firstByteMs = 0;
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
@@ -172,16 +212,19 @@
         clearTimeout(firstByteTimer);
       } else {
         const body = new Uint8Array(await response.arrayBuffer());
+        firstByteMs = performance.now() - startedAt;
         chunks.push(body);
         received = body.byteLength;
       }
       if (signal?.aborted) throw new DOMException("已取消", "AbortError");
       if (received <= 0) throw new Error("直播分片为空");
+      const declared = response.status === 206 ? contentRange.total : Number(response.headers.get("content-length"));
+      if (Number.isFinite(declared) && declared > 0 && received !== declared) throw new Error(`直播分片长度不对：收到 ${received}，应为 ${declared}`);
       const bytes = new Uint8Array(received);
       let offset = 0;
       for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
       const elapsed = Math.max(1, performance.now() - startedAt);
-      ctx.pool.success(host, elapsed, received * 1000 / elapsed);
+      ctx.pool.success(host, firstByteMs || elapsed, received * 1000 / elapsed);
       stats.lastHost = host;
       return { bytes, contentType: response.headers.get("content-type") || "video/iso.segment", host };
     } catch (error) {
@@ -200,6 +243,9 @@
     const hosts = ctx.pool.pick(2);
     if (!hosts.length) throw new Error("没有可用直播节点");
     const controllers = hosts.map(() => new AbortController());
+    const dropped = () => controllers.forEach((c) => { if (!c.signal.aborted) c.abort(ctx.abort.signal.reason); });
+    if (ctx.abort.signal.aborted) dropped();
+    else ctx.abort.signal.addEventListener("abort", dropped, { once: true });
     const overall = setTimeout(() => controllers.forEach((c) => c.abort(new DOMException("直播分片总超时", "TimeoutError"))), SEGMENT_TIMEOUT_MS);
     let primaryFailed = () => {};
     const primaryFailure = new Promise((resolve) => { primaryFailed = resolve; });
@@ -226,6 +272,7 @@
       throw aggregate?.errors?.at?.(-1) || aggregate;
     } finally {
       clearTimeout(overall);
+      ctx.abort.signal.removeEventListener("abort", dropped);
     }
   }
 
@@ -281,11 +328,13 @@
   // What a new playlist drives: prefetch the announced-but-uncached tail, the init map,
   // and — once everything announced is in hand — one speculative future segment, whose
   // 404 only means the encoder has not produced it yet.
-  function onPlaylist(playlistUrl, text) {
-    if (!liveOn()) return;
-    const ctx = contextFor(playlistUrl);
+  function onPlaylist(playlistUrl, text, requestedKey) {
+    if (!liveOn() || requestedKey !== latestPlaylistKey) return;
+    // Only fMP4 media playlists: a master playlist or a TS stream is not the module's business.
+    if (/#EXT-X-STREAM-INF/.test(text) || !/#EXT-X-MAP/.test(text)) return;
     const parsed = core.parseM3u8(text, playlistUrl);
-    if (!parsed.segments.length) return;
+    if (!parsed.segments.length || !parsed.segments.every((segment) => /\.m4s$/i.test(segment.name))) return;
+    const ctx = contextFor(playlistUrl);
     ctx.lastNum = Math.max(ctx.lastNum, parsed.lastNum);
     if (parsed.mapUrl) {
       ctx.mapUrl = parsed.mapUrl;
@@ -318,37 +367,55 @@
     schedulePublish();
   }
 
-  async function serveSegment(url) {
+  async function serveSegment(url, input, init) {
     const ctx = context;
+    const signal = init?.signal || (input instanceof Request ? input.signal : null);
+    if (signal?.aborted) throw signal.reason || new DOMException("已取消", "AbortError");
     const cached = ctx?.cache.get(url);
     const item = cached || (ctx && directoryOf(url) === ctx.key ? cacheSegment(ctx, url, { urgent: true }) : null);
-    if (!item) return nativeFetch(url, { credentials: "omit", cache: "no-store" });
+    if (!item) return nativeFetch(input, init);
     // While the player waits here, the prefetch queue slows to a trickle so the waited-for
     // segment gets the bandwidth.
     if (!cached && ctx) ctx.urgentInflight += 1;
+    let stopWaiting = () => {};
     try {
-      const result = await item.promise;
+      // The download goes on for the cache; only this caller stops waiting.
+      const result = await (signal ? Promise.race([item.promise, new Promise((_resolve, reject) => {
+        stopWaiting = () => reject(signal.reason || new DOMException("已取消", "AbortError"));
+        signal.addEventListener("abort", stopWaiting, { once: true });
+      })]) : item.promise);
       if (!item.hit) {
         item.hit = true;
         stats.acceleratedRequests += 1;
         stats.acceleratedBytes += result.bytes.byteLength;
         schedulePublish();
       }
-      return new Response(result.bytes.slice(), {
+      const response = new Response(result.bytes.slice(), {
         status: 200,
         headers: { "Content-Type": result.contentType, "Content-Length": String(result.bytes.byteLength) }
       });
+      try { Object.defineProperty(response, "url", { value: url }); } catch (_error) {}
+      return response;
     } catch (error) {
+      if (error?.name === "AbortError") throw error;
       stats.lastError = String(error?.message || error).slice(0, 160);
       notices?.log("直播分片下载失败", `${stats.lastError}\n这一片交回给 B 站原来的连接。`, "error", "seg-fallback", "live", "download");
       schedulePublish();
-      return nativeFetch(url, { credentials: "omit", cache: "no-store" });
+      return nativeFetch(input, init);
     } finally {
+      signal?.removeEventListener("abort", stopWaiting);
       if (!cached && ctx) {
         ctx.urgentInflight = Math.max(0, ctx.urgentInflight - 1);
         pumpPrefetch(ctx);
       }
     }
+  }
+
+  // A request whose URL was rewritten keeps everything else the player gave it: headers,
+  // credentials, signal, cache mode.
+  function withUrl(input, url) {
+    if (!(input instanceof Request)) return url;
+    try { return new Request(url, input); } catch (_error) { return url; }
   }
 
   // P2P and relay-wrapped URLs route back to the best official node; without a pool yet,
@@ -371,16 +438,20 @@
     if (method !== "GET") return nativeFetch(input, init);
     const rewritten = rewriteUrl(url);
     if (core.isLivePlaylistUrl(rewritten)) {
-      const pending = nativeFetch(rewritten === url ? input : rewritten, init);
+      const requestedKey = directoryOf(rewritten);
+      latestPlaylistKey = requestedKey;
+      const pending = nativeFetch(rewritten === url ? input : withUrl(input, rewritten), init);
       pending.then((response) => {
-        response.clone().text().then((text) => onPlaylist(response.url || rewritten, text)).catch(() => {});
+        response.clone().text().then((text) => onPlaylist(response.url || rewritten, text, requestedKey)).catch(() => {});
       }).catch(() => {});
       return pending;
     }
-    if (core.isLiveSegmentUrl(rewritten) && !(init?.headers && new Headers(init.headers).get("range"))) {
-      return serveSegment(rewritten);
+    let ranged = false;
+    try { ranged = Boolean((init?.headers && new Headers(init.headers).get("range")) || (input instanceof Request && input.headers.get("range"))); } catch (_error) {}
+    if (core.isLiveSegmentUrl(rewritten) && !ranged) {
+      return serveSegment(rewritten, rewritten === url ? input : withUrl(input, rewritten), init);
     }
-    if (rewritten !== url) return nativeFetch(rewritten, init);
+    if (rewritten !== url) return nativeFetch(withUrl(input, rewritten), init);
     return nativeFetch(input, init);
   };
 
@@ -420,8 +491,11 @@
         notices?.log("直播加速设置已生效", liveOn() ? "直播分片使用多节点竞速下载。" : "直播加速已关闭，使用 B 站原来的连接。", "success", "", "live", "settings");
       }
       if (!liveOn()) {
-        context = null;
+        dropContext();
         stats.playerState = "disabled";
+      } else if (previous.mode !== settings.mode || previous.customHosts.join() !== settings.customHosts.join()) {
+        // A new CDN choice means a new node pool; the next playlist builds it.
+        dropContext();
       }
       publish();
     } else if (event.data.type === "get-stats") {

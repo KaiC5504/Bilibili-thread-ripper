@@ -55,12 +55,16 @@
         <label><input type="radio" name="takeover" value="full"><span>全接管</span></label>
         <label><input type="radio" name="takeover" value="compat"><span>兼容模式</span></label>
       </section>
-      <p class="takeover-note">Safari 用户建议使用兼容模式。<br>全接管：视频由插件自己来放，什么时候下、下多少都由插件安排，效果最好。<br>兼容模式：还是 B 站自己的播放器在放，插件只帮它多线程下载，换清晰度这些都交给 B 站，更不容易出问题。</p>
+      <p class="takeover-note">Safari 用户建议使用兼容模式。<br>全接管：视频由插件自己来放，下载和缓冲都由插件安排，速度最快。<br>兼容模式：当遇到播放问题或设置不生效时，尝试使用兼容模式。</p>
 
       <section class="controls">
         <div class="control-title">
           <label for="concurrency">线程加载数</label>
           <output id="thread-value" for="concurrency">8</output>
+        </div>
+        <div class="auto-row">
+          <label for="auto-concurrency">自动线程数<small>从 8 条开始，播放一跟不上就加到最多 32 条</small></label>
+          <label class="switch"><input id="auto-concurrency" type="checkbox" aria-label="自动线程数"><span></span></label>
         </div>
         <div class="slider">
           <div id="slider-fill" class="slider-fill" aria-hidden="true"></div>
@@ -72,7 +76,7 @@
       </section>
 
       <section class="notice-controls" aria-label="提示设置">
-        <div class="notice-row"><label for="live-enabled">直播加速</label><label class="switch"><input id="live-enabled" type="checkbox" aria-label="直播加速"><span></span></label></div>
+        <div class="notice-row"><label for="live-enabled">直播加速（实验性）</label><label class="switch"><input id="live-enabled" type="checkbox" aria-label="直播加速（实验性）"><span></span></label></div>
         <div class="notice-row"><label for="error-notices">显示错误</label><label class="switch"><input id="error-notices" type="checkbox" aria-label="显示错误"><span></span></label></div>
         <div class="notice-row"><label for="debug-notices">Debug 模式</label><label class="switch"><input id="debug-notices" type="checkbox" aria-label="Debug 模式"><span></span></label></div>
         <fieldset id="debug-filters" class="debug-filters" hidden>
@@ -144,6 +148,10 @@
     .controls { padding: 16px; border: 1px solid #30343d; border-radius: 8px; background: #20232a; }
     .control-title { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; }
     .control-title label { color: #c9ced9; font-size: 13px; }
+    .auto-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
+    .auto-row > label:first-child { display: flex; flex-direction: column; gap: 2px; color: #c9ced9; font-size: 13px; }
+    .auto-row small { color: #8a93a6; font-size: 11px; }
+    .controls.auto .slider, .controls.auto .scale { opacity: 0.4; pointer-events: none; }
     output { min-width: 42px; padding: 4px 8px; border-radius: 5px; color: #fff; background: #fb7299; font-size: 13px; font-weight: 700; text-align: center; }
     .slider { position: relative; width: 100%; height: 18px; border-radius: 9px; background: #3a3e47; }
     .slider-fill { position: absolute; top: 0; bottom: 0; left: 0; width: 60%; border-radius: 9px; background: #fb7299; pointer-events: none; }
@@ -217,6 +225,7 @@
     const $ = (id) => shadow.getElementById(id);
     const enabled = $("enabled");
     const concurrency = $("concurrency");
+    const autoConcurrency = $("auto-concurrency");
     const threadValue = $("thread-value");
     const sliderFill = $("slider-fill");
     const errorNotices = $("error-notices");
@@ -294,6 +303,9 @@
       enabled.checked = settings.enabled;
       for (const radio of shadow.querySelectorAll('input[name="takeover"]')) radio.checked = radio.value === settings.takeover;
       setSlider(settings.concurrency);
+      autoConcurrency.checked = settings.autoConcurrency === true;
+      concurrency.disabled = autoConcurrency.checked;
+      concurrency.closest(".controls").classList.toggle("auto", autoConcurrency.checked);
       setMode(settings.mode);
       customHosts = settings.customHosts;
       renderHosts();
@@ -312,6 +324,7 @@
       setSlider(threads);
       save({ concurrency: threads });
     });
+    autoConcurrency.addEventListener("change", () => save({ autoConcurrency: autoConcurrency.checked }));
     for (const radio of shadow.querySelectorAll('input[name="mode"]')) {
       radio.addEventListener("change", () => {
         if (!radio.checked) return;

@@ -10,9 +10,11 @@
   const SETTINGS_ID = "__bilibili_thread_ripper_native_settings__";
   const SETTINGS_STYLE_ID = "__bilibili_thread_ripper_native_settings_style__";
   if (root[INSTALL_FLAG]) return;
-  // The live site has its own module (live-hook.js); the userscript build loads every
-  // file everywhere, so the video takeover keeps off that hostname.
-  if (/^live\.bilibili\.com$/i.test(root.location?.hostname || "")) return;
+  // The userscript runs on every bilibili.com page (the extension picks pages in its
+  // manifest). The video takeover belongs to the video pages only: the live site has its
+  // own module (live-hook.js), and elsewhere only the settings panel is wanted.
+  const pageHost = root.location?.hostname || "";
+  if (/(^|\.)bilibili\.com$/i.test(pageHost) && !/^(www|m)\.bilibili\.com$/i.test(pageHost)) return;
 
   const core = root.__BILI_RANGE_CORE__;
   const playerFactory = root.__BILI_NATIVE_MSE_PLAYER_FACTORY__;
@@ -64,6 +66,15 @@
   let autoRetakeAt = 0;
   let transferSequence = 1;
   const transfers = new Map();
+  // 自动线程数 lives in the downloader; its steps are reported here.
+  const autoThreads = root.__BILI_IDM_DOWNLOADER_FACTORY__?.autoConcurrency || null;
+  autoThreads?.subscribe(({ threads, previous, reason }) => {
+    if (!settings.autoConcurrency) return;
+    stats.autoThreads = threads;
+    notices?.log(threads > previous ? "线程数加到 " + threads : "线程数退回 " + threads, `${previous} → ${threads}：${reason}。`, "info", "", undefined, "download");
+    schedulePublish();
+  });
+
   const stats = {
     version: "0.9.4.0",
     architecture: "bilibili-native-ui-progressive-mse-0.8-core",
@@ -75,6 +86,7 @@
     acceleratedBytes: 0,
     parallelSubrequests: 0,
     activeThreads: 0,
+    autoThreads: 0,
     totalSpeedBps: 0,
     threadSpeeds: [],
     discoveredCdns: 0,
@@ -370,7 +382,7 @@
   // epoch, 0 if unknown).
   function playinfoAddresses(playinfo) {
     const dash = (playinfo?.data || playinfo)?.dash;
-    return [...(dash?.video || []), ...(dash?.audio || [])].map((item) => {
+    return [...(dash?.video || []), ...(dash?.audio || []), ...[].concat(dash?.dolby?.audio || [], dash?.flac?.audio || [])].map((item) => {
       try {
         const url = new URL(item.baseUrl || item.base_url);
         return { key: `${item.id}|${item.codecid ?? item.codecs ?? ""}|${url.pathname}`, deadline: Number(url.searchParams.get("deadline")) || 0 };
@@ -721,7 +733,7 @@
           { label: "海外 CDN", value: "overseas" },
           { label: "自定义", value: "custom" }
         ], settings.mode),
-        settingGroup("并发线程", "btr-native-concurrency", THREAD_OPTIONS.map((value) => ({ label: String(value), value })), settings.concurrency)
+        settingGroup("并发线程", "btr-native-concurrency", [{ label: "自动", value: "auto" }, ...THREAD_OPTIONS.map((value) => ({ label: String(value), value }))], settings.autoConcurrency ? "auto" : settings.concurrency)
       );
       panel.addEventListener("change", (event) => {
         const input = event.target;
@@ -729,8 +741,12 @@
         if (input.name === "btr-native-mode" && ["mainland", "overseas", "custom"].includes(input.value)) {
           root.postMessage({ channel: CHANNEL, type: "settings-update", payload: { mode: input.value } }, "*");
         } else if (input.name === "btr-native-concurrency") {
-          const concurrency = Number(input.value);
-          if (THREAD_OPTIONS.includes(concurrency)) root.postMessage({ channel: CHANNEL, type: "settings-update", payload: { concurrency } }, "*");
+          if (input.value === "auto") {
+            root.postMessage({ channel: CHANNEL, type: "settings-update", payload: { autoConcurrency: true } }, "*");
+          } else {
+            const concurrency = Number(input.value);
+            if (THREAD_OPTIONS.includes(concurrency)) root.postMessage({ channel: CHANNEL, type: "settings-update", payload: { autoConcurrency: false, concurrency } }, "*");
+          }
         }
       });
       // The servers of the custom mode are picked in the settings panel, so "自定义" opens it,
@@ -745,7 +761,9 @@
       mount.insertBefore(panel, before || mount.firstChild);
     }
     for (const input of panel.querySelectorAll('input[name="btr-native-mode"]')) input.checked = input.value === settings.mode;
-    for (const input of panel.querySelectorAll('input[name="btr-native-concurrency"]')) input.checked = Number(input.value) === settings.concurrency;
+    for (const input of panel.querySelectorAll('input[name="btr-native-concurrency"]')) {
+      input.checked = settings.autoConcurrency ? input.value === "auto" : Number(input.value) === settings.concurrency;
+    }
   }
 
   function scheduleSettingsMenuSync() {
@@ -881,6 +899,7 @@
   // A pending switch therefore arms a short fast loop instead of waiting for the next
   // one-second tick.
   let resolvedSwitchToken = null;
+  let fastResolveToken = null;
   let fastResolveTimer = null;
   let fastResolveUntil = 0;
   function resolveNativeQualitySwitch() {
@@ -888,7 +907,7 @@
     try {
       const pending = root.player?.__core?.()?.qnSwitchingInfo?.video;
       if (!pending?.switching || typeof pending.resolve !== "function" || resolvedSwitchToken === pending) return;
-      armFastResolve();
+      armFastResolve(pending);
       if (stats.playerState !== "ready") return;
       const target = nativeQuality();
       const playingId = Number(player.getDebug?.()?.qualityId) || 0;
@@ -899,9 +918,12 @@
     } catch (_error) {}
   }
 
-  function armFastResolve() {
-    fastResolveUntil = Date.now() + 15000;
-    if (fastResolveTimer) return;
+  function armFastResolve(pending) {
+    if (fastResolveToken !== pending) {
+      fastResolveToken = pending;
+      fastResolveUntil = Date.now() + 15000;
+    }
+    if (fastResolveTimer || Date.now() > fastResolveUntil) return;
     fastResolveTimer = setInterval(() => {
       resolveNativeQualitySwitch();
       suppressNativeSchedulers();
@@ -925,6 +947,7 @@
     catch (_error) { return []; }
   }
 
+  const stoppedSchedulers = new WeakSet();
   function suppressNativeSchedulers() {
     if (!player || player.nativeTransport || playerContainer?.dataset.btrMseActive !== "true") return;
     for (const processor of nativeStreamProcessors()) {
@@ -932,6 +955,7 @@
         const scheduler = processor?.getScheduleController?.();
         if (scheduler?.isStarted?.() && typeof scheduler.stop === "function") {
           scheduler.stop();
+          stoppedSchedulers.add(scheduler);
           remember("native scheduler stopped", String(processor.getType?.() || ""));
         }
       } catch (_error) {}
@@ -942,7 +966,10 @@
     for (const processor of nativeStreamProcessors()) {
       try {
         const scheduler = processor?.getScheduleController?.();
-        if (scheduler && scheduler.isStarted?.() === false && typeof scheduler.start === "function") scheduler.start();
+        if (scheduler && stoppedSchedulers.has(scheduler) && scheduler.isStarted?.() === false && typeof scheduler.start === "function") {
+          scheduler.start();
+          stoppedSchedulers.delete(scheduler);
+        }
       } catch (_error) {}
     }
   }
@@ -1299,12 +1326,14 @@
       settingsLoaded = true;
       notices?.configure(settings);
       const serversChanged = settings.mode === "custom" && previous.customHosts.join(",") !== settings.customHosts.join(",");
-      if (!hadLoadedSettings || previous.enabled !== settings.enabled || previous.takeover !== settings.takeover || previous.mode !== settings.mode || previous.concurrency !== settings.concurrency || serversChanged) {
+      if (!hadLoadedSettings || previous.enabled !== settings.enabled || previous.takeover !== settings.takeover || previous.mode !== settings.mode || previous.concurrency !== settings.concurrency || previous.autoConcurrency !== settings.autoConcurrency || serversChanged) {
         const cdn = settings.mode === "overseas" ? "海外 CDN"
           : settings.mode !== "custom" ? "大陆 CDN"
             : settings.customHosts.length ? `自定义的 ${settings.customHosts.length} 个服务器` : "大陆 CDN（自定义里还没选服务器）";
-        notices?.log("设置已经生效", `${settings.takeover === "compat" ? "兼容模式" : "全接管"}，使用${cdn}，开启 ${settings.concurrency} 条下载线程。`, "success", "", undefined, "settings");
+        const threads = settings.autoConcurrency ? `线程数自动调整（当前 ${autoThreads?.threads() || 8}，8 到 32）` : `开启 ${settings.concurrency} 条下载线程`;
+        notices?.log("设置已经生效", `${settings.takeover === "compat" ? "兼容模式" : "全接管"}，使用${cdn}，${threads}。`, "success", "", undefined, "settings");
       }
+      stats.autoThreads = settings.autoConcurrency ? autoThreads?.threads() || 0 : 0;
       stats.mode = settings.mode;
       syncSettingsMenu();
       if (!settings.enabled) {

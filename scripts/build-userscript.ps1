@@ -15,7 +15,7 @@ function Add-Source([System.Text.StringBuilder]$builder, [string]$file) {
 
 # 页面里运行的部分：和扩展同一份代码、同样的顺序，设置面板也是同一个。两组内容脚本都用到的文件只放一次。
 $pageFiles = @(@("user_scripts/adapter/storage-shim.js") + @($manifest.content_scripts | ForEach-Object { $_.js }) | Select-Object -Unique)
-$sitePatterns = @($manifest.content_scripts | ForEach-Object { $_.matches } | Where-Object { $_ -ne "https://*.bilibili.com/*" } | Select-Object -Unique)
+$sitePatterns = @("https://*.bilibili.com/*")
 
 $header = @(
   "// ==UserScript==",

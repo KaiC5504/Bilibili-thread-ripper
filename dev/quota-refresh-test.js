@@ -326,6 +326,9 @@
     const sessions = player.getDebug().sessionStarts;
     const afterSeek = downloadedUrls.length;
     bufferSetup = { video: { ranges: [] }, audio: { ranges: [] } };
+    // On a fast machine the session has appended everything by now and the fake buffers
+    // report it as one range from the start: the drag must land outside whatever they hold.
+    for (const buffer of buffers) Object.defineProperty(buffer, "buffered", { get: () => ({ length: 0, start() { throw new RangeError("empty"); }, end() { throw new RangeError("empty"); } }) });
     clock = 100;
     video.dispatchEvent(new Event("seeking"));
     const restarted = await until(() => player.getDebug().sessionStarts > sessions
@@ -362,6 +365,56 @@
     const deadlines = [...new Set(downloadedUrls.slice(from).filter((item) => item.url.includes("/64.m4s")).map((item) => Number(new URL(item.url).searchParams.get("deadline"))))];
     player.destroy({ resumeNative: false });
     return { errors, switched, deadlines, pass: !errors.length && switched && deadlines.length === 1 && deadlines[0] === 3000 };
+  }
+
+  // Bilibili's core seeks back to a position it saved when it last reloaded its own source
+  // whenever the element reports new metadata, which every BTR session does. After BTR once
+  // handed the video back at 30 s, a drag to 90 s must not end up at 30 s again; a real drag
+  // right after must still count; and a seek that matches no saved position is left alone.
+  async function nativeRestoreAfterSeek() {
+    const errors = [];
+    const logs = [];
+    video.setAttribute("src", `${location.origin}/native-source`);
+    // A first takeover that hands the video back at 30 s: Bilibili's core saves that position.
+    const first = startPlayer(30, {}, errors, logs);
+    await until(() => downloadedUrls.filter((item) => item.kind === "video").length >= 2, 6000);
+    first.destroy({ resumeNative: true });
+    // The retake, as page-hook does it a few seconds later.
+    const player = startPlayer(30, {}, errors, logs);
+    await until(() => downloadedUrls.filter((item) => item.kind === "video").length >= 2, 6000);
+    const sessions = player.getDebug().sessionStarts;
+    const drag = async (seconds) => { clock = seconds; video.dispatchEvent(new Event("seeking")); const before = player.getDebug().sessionStarts; return until(() => player.getDebug().sessionStarts > before, 3000); };
+    // The viewer drags to 90 s; the new session reports metadata and the core puts 30 s back.
+    const restarted = await drag(90);
+    video.dispatchEvent(new Event("loadedmetadata"));
+    clock = 30;
+    video.dispatchEvent(new Event("seeking"));
+    await sleep(50);
+    const heldAt = clock;
+    const undone = player.getDebug().nativeRestoresUndone;
+    const sessionsAfterUndo = player.getDebug().sessionStarts;
+    // A real drag right after the restore was undone still counts, even back to the very
+    // position the core restored and inside the window in which a restore is undone (the
+    // session is still loading, so it moves that session's start instead of opening another
+    // one).
+    clock = 30; video.dispatchEvent(new Event("seeking"));
+    await sleep(400);
+    const secondAt = clock;
+    const secondDrag = secondAt === 30 && player.getDebug().nativeRestoresUndone === 1;
+    await until(() => player.getDebug().playbackActivated, 6000);
+    // A seek right after metadata that matches no saved position is a viewer's seek.
+    video.dispatchEvent(new Event("loadedmetadata"));
+    const thirdDrag = await drag(100);
+    await sleep(200);
+    const thirdAt = clock;
+    const finalUndone = player.getDebug().nativeRestoresUndone;
+    player.destroy({ resumeNative: false });
+    video.removeAttribute("src");
+    return {
+      errors, restarted, heldAt, undone, sessionsAfterUndo, secondDrag, secondAt, thirdDrag, thirdAt, finalUndone, logs: logs.filter((title) => /回跳/.test(title)),
+      pass: !errors.length && restarted && heldAt === 90 && undone === 1 && sessionsAfterUndo === sessions + 1
+        && secondDrag && thirdDrag && thirdAt === 100 && finalUndone === 1
+    };
   }
 
   // Bilibili's page answers first, then the timed refresh runs twice. After every one of them
@@ -401,7 +454,7 @@
   root.__runQuotaRefreshTest = async function runQuotaRefreshTest() {
     const result = document.getElementById("quota-refresh-result");
     const output = {};
-    for (const [name, scenario] of Object.entries({ scriptedQuota, fullBufferWaits, fullBufferWithNothingAhead, heldSegmentDiesWithItsSession, recoveryUnderALoweredLimit, aStallThatMeetsAFullBufferFails, repeatedRefresh, olderAnswerKeepsNewerAddresses, olderAddressOfAnotherQuality })) {
+    for (const [name, scenario] of Object.entries({ scriptedQuota, fullBufferWaits, fullBufferWithNothingAhead, heldSegmentDiesWithItsSession, recoveryUnderALoweredLimit, aStallThatMeetsAFullBufferFails, repeatedRefresh, olderAnswerKeepsNewerAddresses, olderAddressOfAnotherQuality, nativeRestoreAfterSeek })) {
       try { output[name] = await scenario(); }
       catch (error) { output[name] = { pass: false, crashed: String(error?.stack || error) }; }
     }

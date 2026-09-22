@@ -17,7 +17,9 @@ function checkFile() {
   assert.deepEqual(values("version"), [manifest.version]);
   assert.deepEqual(values("updateURL"), [scriptUrl]);
   assert.deepEqual(values("downloadURL"), [scriptUrl]);
-  assert.deepEqual(values("match"), ["https://www.bilibili.com/*", "https://m.bilibili.com/*", "https://live.bilibili.com/*"]);
+  // Every bilibili.com page: the settings panel opens everywhere, the video and live
+  // modules keep to their own hostnames in the page code.
+  assert.deepEqual(values("match"), ["https://*.bilibili.com/*"]);
   assert.deepEqual(values("run-at"), ["document-start"]);
   assert.deepEqual(values("grant").sort(), ["GM_addElement", "GM_registerMenuCommand", "unsafeWindow"]);
   // Live players sit in live.bilibili.com iframes, so the script must run in frames; the
@@ -62,10 +64,13 @@ const settingsOf = page => page.evaluate(() => __biliThreadRipperDebug.getSettin
     await welcome.waitFor();
     assert.equal(await welcome.locator('input[name="btr-onboarding-mode"]:checked').getAttribute("value"), "mainland");
     assert.equal(await welcome.locator(".btr-onboarding-thread-value").textContent(), "8");
+    // 自动线程数 is on by default; the slider is then the manual fallback.
+    assert.equal(await welcome.locator('input[name="btr-onboarding-auto"]').isChecked(), true);
+    assert.equal(await welcome.locator('input[type="range"]').isDisabled(), true);
     await welcome.locator(".btr-onboarding-save").click();
     await welcome.waitFor({ state: "detached" });
     const saved = await stored();
-    assert.deepEqual([saved.enabled, saved.mode, saved.concurrency, saved.errorNotices, saved.debugNotices], [true, "mainland", 8, false, false]);
+    assert.deepEqual([saved.enabled, saved.mode, saved.concurrency, saved.autoConcurrency, saved.errorNotices, saved.debugNotices], [true, "mainland", 8, true, false, false]);
     assert.equal(await page.evaluate(() => window.chrome?.storage), undefined, "the page's own chrome object must stay untouched");
     // The player menu keeps only what the extension puts there.
     const menu = page.locator("#__bilibili_thread_ripper_native_settings__");
@@ -104,6 +109,11 @@ const settingsOf = page => page.evaluate(() => __biliThreadRipperDebug.getSettin
     await page.waitForFunction(() => __biliThreadRipperDebug.getSettings().errorNotices === true);
     await page.evaluate(() => __BTR_RUNTIME_NOTICES__.log("打开后显示的错误", "这一小段没能下载下来", "error"));
     await page.locator(red).first().waitFor();
+    // The slider only counts once the automatic mode is switched off.
+    assert.equal(await panel.locator("#auto-concurrency").isChecked(), true);
+    assert.equal(await panel.locator("#concurrency").isDisabled(), true);
+    await panel.locator("#auto-concurrency").uncheck({ force: true });
+    await page.waitForFunction(() => __biliThreadRipperDebug.getSettings().autoConcurrency === false);
     await panel.locator("#concurrency").fill("2");
     await page.waitForFunction(() => __biliThreadRipperDebug.getSettings().concurrency === 16);
     assert.equal(await panel.locator("#thread-value").textContent(), "16");

@@ -103,6 +103,9 @@
       errorNotices: source.errorNotices === true,
       debugCategories: Object.fromEntries(["takeover", "playback", "download", "buffer", "settings", "other"].map(key => [key, source.debugCategories?.[key] !== false])),
       concurrency: allowed.includes(requested) ? requested : 8,
+      // 自动线程数: the downloader picks the thread count itself, between 8 and 32, and
+      // `concurrency` above is only what the viewer set by hand. Off unless asked for.
+      autoConcurrency: source.autoConcurrency === true,
       minChunkBytes: 64 * 1024,
       firstByteTimeoutMs: 5500,
       stallTimeoutMs: 4000,
