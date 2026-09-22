@@ -17,6 +17,12 @@
   const QUOTA_FATAL_AHEAD_SECONDS = 10;
   // A video whose buffer stays full through this many waits is given up after all.
   const QUOTA_MAX_WAITS = 8;
+
+  function playbackDeadlineAt(segmentStart, currentTime, playbackRate, now = performance.now()) {
+    const rate = Math.max(0.25, Math.abs(Number(playbackRate) || 1));
+    return now + Math.max(0, (Number(segmentStart) - Number(currentTime)) * 1000 / rate);
+  }
+
   // Bilibili's core keeps the position it saved when it last reloaded its own source (a
   // quality switch, or the retry it makes once BTR replaced the source) and seeks back to
   // it every time the element reports new metadata, until the video ends or the page
@@ -472,12 +478,17 @@
     }
 
     function segmentDownload(candidate, track, segment, index, downloadOptions = {}) {
+      const current = Number(video.currentTime) || candidate.startTime;
+      const deadlineAt = Number.isFinite(Number(downloadOptions.deadlineAt))
+        ? Number(downloadOptions.deadlineAt)
+        : playbackDeadlineAt(segment.startTime, current, video.playbackRate);
       return downloader.downloadRange(segment, track.resolver, {
         signal: generationSignal(candidate),
         parallel: true,
         kind: track.kind,
         priority: downloadOptions.priority,
         hurry: downloadOptions.hurry === true,
+        deadlineAt,
         startup: downloadOptions.startup === true,
         onStartupScheduled: downloadOptions.onStartupScheduled,
         onOrderedChunk: downloadOptions.onOrderedChunk || null
@@ -513,7 +524,10 @@
         const index = track.startupIndex + 1;
         track.followupScheduled = true;
         const segment = track.sidx.segments[index];
-        if (segment) track.prefetches.set(index, segmentDownload(candidate, track, segment, index, { priority: 70, hurry: true }));
+        if (segment) track.prefetches.set(index, segmentDownload(candidate, track, segment, index, {
+          priority: 70,
+          hurry: true
+        }));
       }
       ensureBuffer(candidate);
     }
@@ -1222,5 +1236,5 @@
 
   installBufferedShim();
   installNativeErrorGuard();
-  root.__BILI_NATIVE_MSE_PLAYER_FACTORY__ = Object.freeze({ createNativePlayer, qualityLabel, selectRepresentations });
+  root.__BILI_NATIVE_MSE_PLAYER_FACTORY__ = Object.freeze({ createNativePlayer, playbackDeadlineAt, qualityLabel, selectRepresentations });
 })(globalThis);

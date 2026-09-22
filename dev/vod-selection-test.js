@@ -51,3 +51,9 @@ test("an explicitly chosen 8K representation is used; auto avoids 8K",()=>{
   const noRequested={data:{quality:0,dash:playinfo.data.dash}};
   assert.equal(Number(factory.selectRepresentations(noRequested,0,"").preferred.id),120,"otherwise auto stays at 4K or below");
 });
+
+test("playback deadlines are absolute and account for playback speed",()=>{
+  const factory=load([]);
+  assert.equal(factory.playbackDeadlineAt(10,4,2,1000),4000,"six media seconds at 2x are three wall-clock seconds");
+  assert.equal(factory.playbackDeadlineAt(4,10,2,1000),1000,"an overdue segment keeps the entry timestamp");
+});
