@@ -300,3 +300,47 @@ test("the video and the audio track each get their trials, however they take tur
   }
   assert.ok(counts.video>=2&&counts.audio>=2,`both tracks tried their unmeasured node: video ${counts.video}, audio ${counts.audio}`);
 });
+
+test("hurry work gets the reserved rescue connection",{timeout:30000},async()=>{
+  const {idm}=load();
+  const HOST="upos-sz-mirrorali.bilivideo.com";
+  const only=[mediaUrl(HOST)];
+  const resolver={urls:()=>only,ordered:()=>only,rescueCandidates:()=>only,rangeCandidates:()=>only,allows:()=>true,success(){},failure(){},speed:()=>0};
+  const pending=[],requests=[];
+  const nativeFetch=async(url,init)=>{
+    const {start,end}=rangeOf(init);
+    requests.push({start,end});
+    await new Promise(resolve=>pending.push(resolve));
+    return ok(start,end,64*1024*1024);
+  };
+  const downloader=idm.createDownloader({getSettings:()=>({concurrency:8}),nativeFetch});
+  const normal=downloader.downloadRange({start:0,end:7*64*1024-1,length:7*64*1024},resolver,{parallel:true,kind:"video"});
+  await new Promise(resolve=>setTimeout(resolve,20));
+  assert.equal(requests.length,7,"normal work stops below the rescue reserve");
+  const urgent=downloader.downloadRange({start:8*64*1024,end:9*64*1024-1,length:64*1024},resolver,{parallel:true,kind:"video",hurry:true,deadlineMs:300});
+  await new Promise(resolve=>setTimeout(resolve,20));
+  assert.equal(requests.length,8,"hurry work starts in the reserved slot");
+  while(pending.length) pending.shift()();
+  await Promise.all([normal,urgent]);
+});
+
+test("a near playback deadline shortens the hedge delay",{timeout:30000},async()=>{
+  const {idm}=load();
+  const SLOW="upos-sz-mirrorali.bilivideo.com",FAST="upos-sz-mirrorhw.bilivideo.com";
+  const all=[mediaUrl(SLOW),mediaUrl(FAST)],starts=[],transfers=[];
+  const nativeFetch=async(url,init)=>{
+    const host=new URL(url).hostname;
+    const {start,end}=rangeOf(init);
+    starts.push({host,at:Date.now()});
+    if(host===SLOW) await new Promise(resolve=>setTimeout(resolve,1000));
+    return ok(start,end,64*1024*1024);
+  };
+  const resolver={urls:()=>all,ordered:()=>all,rescueCandidates:()=>all.slice(1),rangeCandidates:()=>all,allows:()=>true,success(){},failure(){},speed:()=>0};
+  const downloader=idm.createDownloader({getSettings:()=>({concurrency:8}),nativeFetch,onTransfer:event=>{transfers.push(event);return transfers.length;}});
+  const started=Date.now();
+  const result=await downloader.downloadRange({start:0,end:128*1024-1,length:128*1024},resolver,{parallel:true,kind:"video",hurry:true,deadlineMs:300});
+  assert.equal(result.bytes.length,128*1024);
+  const fast=starts.find(item=>item.host===FAST);
+  assert.ok(fast && fast.at-started<500,`hedge started before deadline: ${fast?.at-started}ms`);
+  assert.ok(transfers.some(event=>event.phase==="progress" && Number.isFinite(event.etaMs) && event.receivedBytes>0),"progress carries per-request ETA");
+});

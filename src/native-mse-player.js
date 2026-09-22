@@ -478,6 +478,7 @@
         kind: track.kind,
         priority: downloadOptions.priority,
         hurry: downloadOptions.hurry === true,
+        deadlineMs: downloadOptions.deadlineMs,
         startup: downloadOptions.startup === true,
         onStartupScheduled: downloadOptions.onStartupScheduled,
         onOrderedChunk: downloadOptions.onOrderedChunk || null
@@ -561,6 +562,7 @@
               // With under ten seconds buffered a late segment is a stall, so the downloader
               // spreads its pieces and copies a slow one sooner.
               hurry: segment.startTime - current < 10,
+              deadlineMs: Math.max(0, (segment.startTime - current) * 1000),
               startup,
               onStartupScheduled: startup ? () => {
                 track.startupScheduled = true;

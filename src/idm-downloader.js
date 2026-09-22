@@ -11,6 +11,7 @@
   // A shorter transfer is mostly round trip. The tail of a resumed piece can be a few KiB,
   // and counting it would mark down the very node that came to the rescue.
   const SPEED_SAMPLE_MIN_BYTES = 48 * 1024;
+  const URGENT_PRIORITY = 200;
 
   function abortError(reason) {
     if (reason instanceof Error || reason instanceof DOMException) return reason;
@@ -20,13 +21,15 @@
   class Semaphore {
     constructor(limit) {
       this.limit = limit;
+      this.reserve = 0;
       this.active = 0;
       this.queue = [];
       this.sequence = 0;
     }
 
-    setLimit(limit) {
+    setLimit(limit, reserve = this.reserve) {
       this.limit = Math.max(1, Math.min(512, Math.trunc(limit) || 1));
+      this.reserve = Math.max(0, Math.min(this.limit - 1, Math.trunc(reserve) || 0));
       this.drain();
     }
 
@@ -36,7 +39,12 @@
 
     drainQueue() {
       while (this.active < this.limit && this.queue.length) {
-        const entry = this.queue.shift();
+        // Keep a small number of slots genuinely available for playback-critical
+        // or rescue work. Normal work may borrow them only when no urgent waiter exists.
+        const urgent = this.queue.findIndex(entry => entry.priority >= URGENT_PRIORITY);
+        const normalAllowed = this.active < this.limit - this.reserve;
+        if (urgent < 0 && !normalAllowed) break;
+        const entry = this.queue.splice(urgent >= 0 ? urgent : 0, 1)[0];
         entry.signal?.removeEventListener("abort", entry.cancel);
         if (entry.signal?.aborted) {
           entry.reject(abortError(entry.signal.reason));
@@ -337,18 +345,23 @@
 
     // A second copy starts once a piece takes clearly longer than pieces have been
     // taking, instead of always waiting the full fixed delay.
-    function hedgeDelayMs(settings) {
-      if (!meter.pieceMs) return settings.hedgeDelayMs;
-      return Math.max(250, Math.min(settings.hedgeDelayMs, Math.round(meter.pieceMs * 1.5)));
+    function hedgeDelayMs(settings, deadlineMs = Infinity) {
+      const measured = meter.pieceMs
+        ? Math.max(250, Math.min(settings.hedgeDelayMs, Math.round(meter.pieceMs * 1.5)))
+        : settings.hedgeDelayMs;
+      if (!Number.isFinite(deadlineMs) || deadlineMs <= 0) return measured;
+      // A piece whose predicted playback deadline is close should hedge earlier,
+      // while retaining a short floor to avoid duplicating every tiny request.
+      return Math.max(150, Math.min(measured, Math.floor(deadlineMs * 0.35)));
     }
 
-    async function readBody(response, controller, transferId, settings, received) {
+    async function readBody(response, controller, transferId, settings, received, report = onTransfer) {
       if (!response.body?.getReader) {
         const bytes = new Uint8Array(await response.arrayBuffer());
         received.bytes += bytes.byteLength;
         received.chunks?.push(bytes);
         if (settings.autoConcurrency) autoConcurrency.activity();
-        onTransfer({ phase: "progress", id: transferId, bytes: bytes.byteLength });
+        report({ phase: "progress", id: transferId, bytes: bytes.byteLength });
         return bytes;
       }
       const reader = response.body.getReader();
@@ -379,7 +392,7 @@
           // hedge copy can ask only for the missing tail.
           received.chunks?.push(chunk);
           if (settings.autoConcurrency) autoConcurrency.activity();
-          onTransfer({ phase: "progress", id: transferId, bytes: chunk.byteLength });
+          report({ phase: "progress", id: transferId, bytes: chunk.byteLength });
         }
       } finally {
         clearTimeout(stallTimer);
@@ -418,8 +431,15 @@
       else signal?.addEventListener("abort", cancel, { once: true });
       const firstByteTimer = setTimeout(() => controller.abort(new DOMException("CDN 首字节超时", "TimeoutError")), settings.firstByteTimeoutMs);
       const totalTimer = setTimeout(() => controller.abort(new DOMException("CDN 子块总耗时超限", "TimeoutError")), settings.attemptTimeoutMs);
-      const transferId = onTransfer({ phase: "start", kind, totalBytes: piece.length, url });
       const startedAt = performance.now();
+      const report = event => {
+        const elapsedMs = Math.max(1, performance.now() - startedAt);
+        const bps = received.bytes * 1000 / elapsedMs;
+        const remaining = Math.max(0, piece.length - received.bytes);
+        return onTransfer({ ...event, receivedBytes: received.bytes, totalBytes: piece.length,
+          bps, etaMs: bps > 0 ? Math.round(remaining * 1000 / bps) : null });
+      };
+      const transferId = report({ phase: "start", kind, totalBytes: piece.length, url });
       try {
         const response = await nativeFetch(url, {
           method: "GET",
@@ -438,13 +458,13 @@
           // The status tells a refused signed address (4xx) apart from a node that is down.
           throw Object.assign(new Error(`Range 校验失败：HTTP ${response.status}`), { status: response.status });
         }
-        const bytes = await readBody(response, controller, transferId, settings, received);
+        const bytes = await readBody(response, controller, transferId, settings, received, report);
         if (bytes.byteLength !== piece.length) throw new Error(`子块长度不符：${bytes.byteLength}/${piece.length}`);
         const elapsedMs = Math.max(1, performance.now() - startedAt);
         recordMeter(bytes.byteLength, elapsedMs);
         // The node answered either way; only a large enough transfer says how fast it is.
         resolver.success(url, bytes.byteLength >= SPEED_SAMPLE_MIN_BYTES ? bytes.byteLength * 1000 / elapsedMs : 0);
-        onTransfer({ phase: "done", id: transferId });
+        report({ phase: "done", id: transferId });
         return { bytes, total: contentRange.total, url };
       } catch (error) {
         const canceled = error?.name === "AbortError";
@@ -461,7 +481,7 @@
           if (error?.status === 412 || error?.status === 429) autoConcurrency.pushback(error.status);
           else if (!canceled && error?.name === "TimeoutError" && received.bytes === 0) autoConcurrency.slow();
         }
-        onTransfer({ phase: canceled ? "cancel" : "error", id: transferId, error });
+        report({ phase: canceled ? "cancel" : "error", id: transferId, error });
         throw error;
       } finally {
         clearTimeout(firstByteTimer);
@@ -521,7 +541,7 @@
       return candidates;
     }
 
-    async function downloadPiece(piece, resolver, signal, kind, preferredUrls, startupMode = false, priority = 0) {
+    async function downloadPiece(piece, resolver, signal, kind, preferredUrls, startupMode = false, priority = 0, deadlineMs = Infinity) {
       const settings = config();
       const allowed = (url) => typeof resolver.allows !== "function" || resolver.allows(url);
       const startup = startupMode === true || startupMode === "probe";
@@ -579,7 +599,7 @@
           const contexts = [];
           const attempts = pair.map((url, pairIndex) => (async () => {
             if (pairIndex) await new Promise((resolve, reject) => {
-              const delay = probe ? 0 : startup ? Math.min(250, settings.hedgeDelayMs) : hedgeDelayMs(settings);
+              const delay = probe ? 0 : startup ? Math.min(250, settings.hedgeDelayMs) : hedgeDelayMs(settings, deadlineMs);
               const timer = setTimeout(resolve, delay);
               firstFailure.then(() => {
                 clearTimeout(timer);
@@ -761,7 +781,7 @@
     }
 
     async function downloadStartupRange(range, resolver, options) {
-      semaphore.setLimit(config().concurrency);
+      semaphore.setLimit(config().concurrency, 0);
       const piece = { index: 0, start: range.start, end: range.end, length: range.length };
       const startedAt = performance.now();
       let lastError = null;
@@ -795,7 +815,8 @@
 
     async function downloadStartupMediaRange(range, resolver, options, settings) {
       const effectiveConcurrency = settings.concurrency;
-      semaphore.setLimit(effectiveConcurrency);
+      const rescueReserve = Math.max(1, Math.min(16, Math.ceil(effectiveConcurrency / 8)));
+      semaphore.setLimit(effectiveConcurrency, rescueReserve);
       const candidateUrls = (typeof resolver.rangeCandidates === "function" ? resolver.rangeCandidates() : resolver.urls())
         .filter((url, index, all) => all.indexOf(url) === index);
       const headLength = Math.min(range.length, Math.max(64 * 1024, settings.minChunkBytes));
@@ -827,7 +848,6 @@
         };
       }
 
-      const rescueReserve = Math.max(1, Math.min(16, Math.ceil(effectiveConcurrency / 8)));
       const mediaBudget = Math.max(1, effectiveConcurrency - rescueReserve);
       const audioBudget = Math.max(1, Math.min(mediaBudget, Math.ceil(effectiveConcurrency / 8)));
       const pieceBudget = options.kind === "audio"
@@ -869,7 +889,8 @@
           options.kind || "media",
           preferredFor(primaries[orderedIndex], [headResult.url, ...candidateUrls.filter((url) => url !== headResult.url)]),
           true,
-          120 - Math.min(30, piece.index)
+          120 - Math.min(30, piece.index),
+          options.deadlineMs
         );
         ordered[orderedIndex] = result;
         await flushOrdered();
@@ -907,14 +928,18 @@
       const effectiveConcurrency = parallel ? Math.min(globalConcurrency, requestedConcurrency) : 1;
       // 后台预取可以限制自己的子块数，但不能降低全局信号量上限；
       // 否则一个低优先级预取会把后续播放器的紧急请求也锁在低并发上。
-      semaphore.setLimit(globalConcurrency);
-      const basePriority = Number.isFinite(Number(options.priority)) ? Number(options.priority) : 50;
-      const rescueReserve = parallel && effectiveConcurrency >= 8
-        ? Math.min(8, Math.max(1, Math.ceil(effectiveConcurrency / 8)))
+      const hurry = options.hurry === true;
+      const rescueReserve = parallel && globalConcurrency >= 8
+        ? Math.min(8, Math.max(1, Math.ceil(globalConcurrency / 8)))
         : 0;
+      semaphore.setLimit(globalConcurrency, rescueReserve);
+      const basePriority = (Number.isFinite(Number(options.priority)) ? Number(options.priority) : 50)
+        + (hurry ? 180 : 0);
       const pieceConcurrency = options.startup === true
         ? Math.max(1, Math.min(22, effectiveConcurrency))
-        : Math.max(1, effectiveConcurrency - rescueReserve);
+        : hurry
+          ? effectiveConcurrency
+          : Math.max(1, effectiveConcurrency - rescueReserve);
       const pieces = core.splitRange(
         range.start,
         range.end,
@@ -945,7 +970,8 @@
           options.kind || "media",
           preferredFor(primaries[piece.index], preferredUrls),
           options.startup === true,
-          basePriority - Math.min(20, piece.index)
+          basePriority - Math.min(20, piece.index),
+          options.deadlineMs
         );
         if (progressive) {
           ordered[piece.index] = result;
