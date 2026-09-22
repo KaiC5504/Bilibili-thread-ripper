@@ -303,92 +303,116 @@ test("the video and the audio track each get their trials, however they take tur
   assert.ok(counts.video>=2&&counts.audio>=2,`both tracks tried their unmeasured node: video ${counts.video}, audio ${counts.audio}`);
 });
 
-test("normal work can use the full configured concurrency",{timeout:30000},async()=>{
+test("a normal range leaves one connection slot for a stalled piece to change node",{timeout:30000},async()=>{
   const {idm}=load();
-  const HOST="upos-sz-mirrorali.bilivideo.com";
-  const only=[mediaUrl(HOST)];
-  const resolver={urls:()=>only,ordered:()=>only,rescueCandidates:()=>only,rangeCandidates:()=>only,allows:()=>true,success(){},failure(){},speed:()=>0};
+  const A="upos-sz-mirrorali.bilivideo.com",B="upos-sz-mirrorhw.bilivideo.com",all=[mediaUrl(A),mediaUrl(B)];
+  const resolver={urls:()=>all,ordered:()=>all,rescueCandidates:()=>all.slice(1),rangeCandidates:()=>all,allows:()=>true,success(){},failure(){},speed:()=>0};
   const pending=[],requests=[];
   const nativeFetch=async(url,init)=>{
     const {start,end}=rangeOf(init);
-    requests.push({start,end});
+    requests.push({start,end,at:Date.now(),host:new URL(url).hostname});
     await new Promise(resolve=>pending.push(resolve));
     return ok(start,end,64*1024*1024);
   };
   const downloader=idm.createDownloader({getSettings:()=>({concurrency:8}),nativeFetch});
   const normal=downloader.downloadRange({start:0,end:8*64*1024-1,length:8*64*1024},resolver,{parallel:true,kind:"video"});
   await new Promise(resolve=>setTimeout(resolve,20));
-  assert.equal(requests.length,8,"normal work is not hard-limited below the configured concurrency");
-  while(pending.length) pending.shift()();
+  assert.equal(requests.length,7,"seven primary pieces leave one rescue slot at concurrency eight");
+  await new Promise(resolve=>setTimeout(resolve,950));
+  assert.equal(requests.length,8,"a hedge uses the spare slot before the 5.5 second first-byte timeout");
+  const drain=setInterval(()=>{while(pending.length)pending.shift()();},10);
   await normal;
+  clearInterval(drain);
 });
 
-test("a near playback deadline shortens a single-piece hedge delay",{timeout:30000},async()=>{
+test("an expired deadline does not blindly fan out to every piece",{timeout:30000},async()=>{
   const {idm}=load();
-  const SLOW="upos-sz-mirrorali.bilivideo.com",FAST="upos-sz-mirrorhw.bilivideo.com";
-  const all=[mediaUrl(SLOW),mediaUrl(FAST)],starts=[],transfers=[];
+  const A="upos-sz-mirrorali.bilivideo.com",B="upos-sz-mirrorhw.bilivideo.com",all=[mediaUrl(A),mediaUrl(B)],starts=[],pending=[];
   const nativeFetch=async(url,init)=>{
-    const host=new URL(url).hostname;
     const {start,end}=rangeOf(init);
-    starts.push({host,at:Date.now()});
-    if(host===SLOW) await new Promise(resolve=>setTimeout(resolve,1000));
+    starts.push({start,host:new URL(url).hostname,at:Date.now()});
+    await new Promise(resolve=>pending.push({start,resolve}));
     return ok(start,end,64*1024*1024);
   };
   const resolver={urls:()=>all,ordered:()=>all,rescueCandidates:()=>all.slice(1),rangeCandidates:()=>all,allows:()=>true,success(){},failure(){},speed:()=>0};
-  const downloader=idm.createDownloader({getSettings:()=>({concurrency:8}),nativeFetch,onTransfer:event=>{transfers.push(event);return transfers.length;}});
-  const started=Date.now();
-  const result=await downloader.downloadRange({start:0,end:64*1024-1,length:64*1024},resolver,{parallel:true,kind:"video",maxConcurrency:1,deadlineMs:300});
-  assert.equal(result.bytes.length,64*1024);
-  const fast=starts.find(item=>item.host===FAST);
-  assert.ok(fast && fast.at-started<300,`hedge started before deadline: ${fast?.at-started}ms`);
-  assert.ok(transfers.some(event=>event.phase==="progress" && Number.isFinite(event.etaMs) && event.receivedBytes>0),"progress carries per-request ETA");
+  const downloader=idm.createDownloader({getSettings:()=>({concurrency:8}),nativeFetch});
+  const task=downloader.downloadRange({start:0,end:8*64*1024-1,length:8*64*1024},resolver,{parallel:true,kind:"video",deadlineMs:0});
+  await new Promise(resolve=>setTimeout(resolve,80));
+  assert.equal(starts.length,7,"an expired deadline does not immediately duplicate every piece");
+  await new Promise(resolve=>setTimeout(resolve,240));
+  assert.equal(starts.length,7,"deadline alone does not duplicate any piece before it proves slow");
+  const ordinary=pending[0];
+  pending.splice(pending.indexOf(ordinary),1);
+  ordinary.resolve();
+  await new Promise(resolve=>setTimeout(resolve,80));
+  assert.equal(starts.length,7,"freeing a slot still does not trigger deadline-only duplication");
+  const drain=setInterval(()=>{while(pending.length)pending.shift().resolve();},10);
+  await task;
+  clearInterval(drain);
 });
 
-test("an expired deadline starts the hedge immediately",{timeout:30000},async()=>{
-  const {idm}=load();
-  const SLOW="upos-sz-mirrorali.bilivideo.com",FAST="upos-sz-mirrorhw.bilivideo.com";
-  const all=[mediaUrl(SLOW),mediaUrl(FAST)],starts=[];
+test("progress ETA gives one measured straggler the rescue slot before the fixed delay",{timeout:30000},async()=>{
+  const {idm}=load(),A="upos-sz-mirrorali.bilivideo.com",B="upos-sz-mirrorhw.bilivideo.com",all=[mediaUrl(A),mediaUrl(B)];
+  const seen=new Map(),starts=[];
   const nativeFetch=async(url,init)=>{
-    const host=new URL(url).hostname, range=rangeOf(init);
-    starts.push({host,at:Date.now()});
-    if(host===SLOW) await new Promise(resolve=>setTimeout(resolve,1000));
-    return ok(range.start,range.end,64*1024*1024);
+    const {start,end}=rangeOf(init),length=end-start+1,count=(seen.get(start)||0)+1;
+    seen.set(start,count);starts.push({start,count,at:Date.now()});
+    if(start>=60*1024*1024){
+      await new Promise(resolve=>setTimeout(resolve,600));
+      return ok(start,end,128*1024*1024);
+    }
+    if(count>1)return ok(start,end,128*1024*1024);
+    let firstTimer,finishTimer;
+    const body=new ReadableStream({
+      start(controller){
+        firstTimer=setTimeout(()=>controller.enqueue(new Uint8Array(8*1024)),300);
+        finishTimer=setTimeout(()=>{controller.enqueue(new Uint8Array(length-8*1024));controller.close();},1000);
+        init.signal?.addEventListener("abort",()=>{clearTimeout(firstTimer);clearTimeout(finishTimer);try{controller.error(new DOMException("aborted","AbortError"));}catch(_error){}},{once:true});
+      },
+      cancel(){clearTimeout(firstTimer);clearTimeout(finishTimer);}
+    });
+    return new Response(body,{status:206,headers:{"Content-Range":`bytes ${start}-${end}/${64*1024*1024}`}});
   };
+  const fastResolver={urls:()=>[all[0]],ordered:()=>[all[0]],rescueCandidates:()=>[],rangeCandidates:()=>[all[0]],allows:()=>true,success(){},failure(){},speed:()=>0};
   const resolver={urls:()=>all,ordered:()=>all,rescueCandidates:()=>all.slice(1),rangeCandidates:()=>all,allows:()=>true,success(){},failure(){},speed:()=>0};
   const downloader=idm.createDownloader({getSettings:()=>({concurrency:8}),nativeFetch});
-  const started=Date.now();
-  await downloader.downloadRange({start:0,end:64*1024-1,length:64*1024},resolver,{parallel:true,kind:"video",maxConcurrency:1,deadlineMs:0});
-  const fast=starts.find(item=>item.host===FAST);
-  assert.ok(fast && fast.at-started<150,`expired deadline hedges immediately: ${fast?.at-started}ms`);
+  const warmStart=60*1024*1024,warmLength=1024*1024;
+  await downloader.downloadRange({start:warmStart,end:warmStart+warmLength-1,length:warmLength},fastResolver,{parallel:true,kind:"video",maxConcurrency:1});
+  const began=Date.now();
+  await downloader.downloadRange({start:0,end:8*64*1024-1,length:8*64*1024},resolver,{parallel:true,kind:"video",deadlineMs:0});
+  const rescue=starts.find(item=>item.start>=0&&item.count===2);
+  assert.ok(rescue&&rescue.at-began>=200&&rescue.at-began<700,`ETA rescue starts after grace and before fixed delay: ${rescue?.at-began}ms`);
 });
 
-test("queued pieces follow playback deadline instead of enqueue order",{timeout:30000},async()=>{
+test("one absolute deadline is shared by the startup probe and its tail pieces",{timeout:30000},async()=>{
   const {idm}=load();
-  const HOST="upos-sz-mirrorali.bilivideo.com",only=[mediaUrl(HOST)];
-  const pending=[],requests=[];
+  const A="upos-sz-mirrorali.bilivideo.com",B="upos-sz-mirrorhw.bilivideo.com",all=[mediaUrl(A),mediaUrl(B)],deadlines=[];
   const nativeFetch=async(url,init)=>{
     const range=rangeOf(init);
-    requests.push({start:range.start,at:Date.now()});
-    await new Promise(resolve=>pending.push({resolve,start:range.start,end:range.end}));
+    await new Promise(resolve=>setTimeout(resolve,range.start===0?80:5));
     return ok(range.start,range.end,128*1024*1024);
   };
-  const resolver={urls:()=>only,ordered:()=>only,rescueCandidates:()=>only,rangeCandidates:()=>only,allows:()=>true,success(){},failure(){},speed:()=>0};
+  const resolver={urls:()=>all,ordered:()=>all,rescueCandidates:()=>all.slice(1),rangeCandidates:()=>all,allows:()=>true,success(){},failure(){},speed:()=>0};
+  const downloader=idm.createDownloader({getSettings:()=>({concurrency:8}),nativeFetch,onTransfer:event=>{if(event.phase==="start"&&event.deadlineAt)deadlines.push(event.deadlineAt);return deadlines.length;}});
+  await downloader.downloadRange({start:0,end:8*64*1024-1,length:8*64*1024},resolver,{parallel:true,startup:true,kind:"video",deadlineMs:1000,onOrderedChunk:async()=>{}});
+  assert.ok(deadlines.length>2,"probe and tail requests were observed");
+  assert.equal(new Set(deadlines.map(Math.round)).size,1,"all pieces keep the deadline fixed at range entry");
+});
+
+test("metadata priority stays ahead of media regardless of media deadlines",{timeout:30000},async()=>{
+  const {idm}=load(),HOST="upos-sz-mirrorali.bilivideo.com",only=[mediaUrl(HOST)],pending=[],requests=[];
+  const resolver={urls:()=>only,ordered:()=>only,startupCandidates:()=>only,rescueCandidates:()=>only,rangeCandidates:()=>only,allows:()=>true,success(){},failure(){},speed:()=>0};
+  const nativeFetch=async(_url,init)=>{const range=rangeOf(init);requests.push(range.start);await new Promise(resolve=>pending.push(resolve));return ok(range.start,range.end,128*1024*1024);};
   const downloader=idm.createDownloader({getSettings:()=>({concurrency:4}),nativeFetch});
-  const block=downloader.downloadRange({start:0,end:4*64*1024-1,length:4*64*1024},resolver,{parallel:true,kind:"video",deadlineMs:10000});
+  const blocker=downloader.downloadRange({start:0,end:4*64*1024-1,length:4*64*1024},resolver,{parallel:true,kind:"video",priority:50,deadlineMs:0});
   await new Promise(resolve=>setTimeout(resolve,20));
-  const far=downloader.downloadRange({start:8*64*1024,end:12*64*1024-1,length:4*64*1024},resolver,{parallel:true,kind:"video",deadlineMs:5000});
-  const nearStart=16*64*1024;
-  const near=downloader.downloadRange({start:nearStart,end:20*64*1024-1,length:4*64*1024},resolver,{parallel:true,kind:"video",deadlineMs:0});
-  await new Promise(resolve=>setTimeout(resolve,20));
-  for(const item of pending.splice(0,4)) item.resolve();
-  for(let tick=0; requests.length<8 && tick<100; tick+=1) await new Promise(resolve=>setTimeout(resolve,5));
-  assert.ok(requests.length>=8,"queued work starts after the blocking requests finish");
-  assert.ok(requests.slice(4,8).every(item=>item.start>=nearStart),"expired deadline pieces overtake older queued prefetch");
-  for(let tick=0; requests.length<12 && tick<100; tick+=1) {
-    while(pending.length) pending.shift().resolve();
-    await new Promise(resolve=>setTimeout(resolve,5));
-  }
-  while(pending.length) pending.shift().resolve();
-  assert.equal(requests.length,12,"all queued ranges are released");
-  await Promise.all([block,far,near]);
+  const mediaStart=8*64*1024,metaStart=64*1024*1024;
+  const media=downloader.downloadRange({start:mediaStart,end:mediaStart+64*1024-1,length:64*1024},resolver,{parallel:true,kind:"video",priority:120,deadlineMs:0});
+  const meta=downloader.downloadRange({start:metaStart,end:metaStart+1023,length:1024},resolver,{parallel:false,kind:"meta"});
+  pending.shift()();
+  for(let tick=0;requests.length<5&&tick<100;tick+=1)await new Promise(resolve=>setTimeout(resolve,5));
+  assert.equal(requests[4],metaStart,"priority 220 metadata starts before deadline-bearing media");
+  const drain=setInterval(()=>{while(pending.length)pending.shift()();},10);
+  await Promise.all([blocker,media,meta]);
+  clearInterval(drain);
 });

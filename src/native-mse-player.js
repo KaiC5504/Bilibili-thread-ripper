@@ -17,6 +17,12 @@
   const QUOTA_FATAL_AHEAD_SECONDS = 10;
   // A video whose buffer stays full through this many waits is given up after all.
   const QUOTA_MAX_WAITS = 8;
+
+  function playbackDeadlineAt(segmentStart, currentTime, playbackRate, now = performance.now()) {
+    const rate = Math.max(0.25, Math.abs(Number(playbackRate) || 1));
+    return now + Math.max(0, (Number(segmentStart) - Number(currentTime)) * 1000 / rate);
+  }
+
   // Bilibili's core keeps the position it saved when it last reloaded its own source (a
   // quality switch, or the retry it makes once BTR replaced the source) and seeks back to
   // it every time the element reports new metadata, until the video ends or the page
@@ -472,13 +478,17 @@
     }
 
     function segmentDownload(candidate, track, segment, index, downloadOptions = {}) {
+      const current = Number(video.currentTime) || candidate.startTime;
+      const deadlineAt = Number.isFinite(Number(downloadOptions.deadlineAt))
+        ? Number(downloadOptions.deadlineAt)
+        : playbackDeadlineAt(segment.startTime, current, video.playbackRate);
       return downloader.downloadRange(segment, track.resolver, {
         signal: generationSignal(candidate),
         parallel: true,
         kind: track.kind,
         priority: downloadOptions.priority,
         hurry: downloadOptions.hurry === true,
-        deadlineMs: downloadOptions.deadlineMs,
+        deadlineAt,
         startup: downloadOptions.startup === true,
         onStartupScheduled: downloadOptions.onStartupScheduled,
         onOrderedChunk: downloadOptions.onOrderedChunk || null
@@ -510,15 +520,13 @@
       if (candidate.startupPrefetchLaunched || !sessionIsCurrent(candidate) || !candidate.tracks.length) return;
       if (!candidate.tracks.every((track) => track.startupScheduled)) return;
       candidate.startupPrefetchLaunched = true;
-      const current = Number(video.currentTime) || candidate.startTime;
       for (const track of candidate.tracks) {
         const index = track.startupIndex + 1;
         track.followupScheduled = true;
         const segment = track.sidx.segments[index];
         if (segment) track.prefetches.set(index, segmentDownload(candidate, track, segment, index, {
           priority: 70,
-          hurry: true,
-          deadlineMs: Math.max(0, (segment.startTime - current) * 1000)
+          hurry: true
         }));
       }
       ensureBuffer(candidate);
@@ -567,7 +575,6 @@
               // With under ten seconds buffered a late segment is a stall, so the downloader
               // spreads its pieces and copies a slow one sooner.
               hurry: segment.startTime - current < 10,
-              deadlineMs: Math.max(0, (segment.startTime - current) * 1000),
               startup,
               onStartupScheduled: startup ? () => {
                 track.startupScheduled = true;
@@ -1229,5 +1236,5 @@
 
   installBufferedShim();
   installNativeErrorGuard();
-  root.__BILI_NATIVE_MSE_PLAYER_FACTORY__ = Object.freeze({ createNativePlayer, qualityLabel, selectRepresentations });
+  root.__BILI_NATIVE_MSE_PLAYER_FACTORY__ = Object.freeze({ createNativePlayer, playbackDeadlineAt, qualityLabel, selectRepresentations });
 })(globalThis);

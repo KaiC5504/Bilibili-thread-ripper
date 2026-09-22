@@ -36,15 +36,7 @@
 
     drainQueue() {
       while (this.active < this.limit && this.queue.length) {
-        let best = 0;
-        for (let index = 1; index < this.queue.length; index += 1) {
-          const candidate = this.queue[index], current = this.queue[best];
-          if (candidate.deadlineAt < current.deadlineAt
-            || (candidate.deadlineAt === current.deadlineAt && candidate.priority > current.priority)
-            || (candidate.deadlineAt === current.deadlineAt && candidate.priority === current.priority
-              && candidate.sequence < current.sequence)) best = index;
-        }
-        const entry = this.queue.splice(best, 1)[0];
+        const entry = this.queue.shift();
         entry.signal?.removeEventListener("abort", entry.cancel);
         if (entry.signal?.aborted) {
           entry.reject(abortError(entry.signal.reason));
@@ -60,7 +52,7 @@
       }
     }
 
-    acquire(signal, priority = 0, deadlineAt = Infinity) {
+    acquire(signal, priority = 0) {
       if (signal?.aborted) return Promise.reject(abortError(signal.reason));
       return new Promise((resolve, reject) => {
         const entry = {
@@ -69,7 +61,6 @@
           signal,
           released: false,
           priority: Number(priority) || 0,
-          deadlineAt: Number.isFinite(deadlineAt) ? deadlineAt : Infinity,
           sequence: this.sequence++
         };
         entry.cancel = () => {
@@ -81,6 +72,7 @@
         };
         signal?.addEventListener("abort", entry.cancel, { once: true });
         this.queue.push(entry);
+        this.queue.sort((a, b) => b.priority - a.priority || a.sequence - b.sequence);
         this.drain();
         this.onChange?.(this.active, this.limit, this.queue.length);
       });
@@ -345,16 +337,22 @@
 
     // A second copy starts once a piece takes clearly longer than pieces have been
     // taking, instead of always waiting the full fixed delay.
-    function hedgeDelayMs(settings, deadlineAt = Infinity) {
-      const measured = meter.pieceMs
+    function hedgeDelayMs(settings) {
+      return meter.pieceMs
         ? Math.max(250, Math.min(settings.hedgeDelayMs, Math.round(meter.pieceMs * 1.5)))
         : settings.hedgeDelayMs;
-      if (!Number.isFinite(deadlineAt)) return measured;
-      const remainingMs = deadlineAt - performance.now();
-      if (remainingMs <= 0) return 0;
-      // A piece whose predicted playback deadline is close should hedge earlier,
-      // while retaining a short floor to avoid duplicating every tiny request.
-      return Math.max(150, Math.min(measured, Math.floor(remainingMs * 0.35)));
+    }
+
+    // Only measured per-request progress can spend this bounded rescue budget.
+    function createEarlyHedge(limit) {
+      return {
+        progressRemaining: Math.max(0, limit),
+        claimProgress() {
+          if (this.progressRemaining <= 0) return false;
+          this.progressRemaining -= 1;
+          return true;
+        }
+      };
     }
 
     async function readBody(response, controller, transferId, settings, received, report = onTransfer) {
@@ -413,9 +411,10 @@
     // begin: called once the request has its connection slot, and returns what to ask for.
     // A copy that waited in the queue resumes from what the first copy has received by then,
     // not from what it had when the copy was queued.
-    async function attempt(piece, url, signal, kind, resolver, priority = 0, begin = null, deadlineAt = Infinity) {
+    async function attempt(piece, url, signal, kind, resolver, priority = 0, begin = null,
+      deadlineAt = Infinity, observeProgress = null) {
       const settings = config();
-      const release = await semaphore.acquire(signal, priority, deadlineAt);
+      const release = await semaphore.acquire(signal, priority);
       let received = { bytes: 0, chunks: [] };
       if (begin) {
         try {
@@ -438,10 +437,13 @@
         const elapsedMs = Math.max(1, performance.now() - startedAt);
         const bps = received.bytes * 1000 / elapsedMs;
         const remaining = Math.max(0, piece.length - received.bytes);
-        return onTransfer({ ...event, receivedBytes: received.bytes, totalBytes: piece.length,
-          bps, etaMs: bps > 0 ? Math.round(remaining * 1000 / bps) : null });
+        const payload = { ...event, receivedBytes: received.bytes, totalBytes: piece.length,
+          bps, etaMs: bps > 0 ? Math.round(remaining * 1000 / bps) : null };
+        observeProgress?.({ ...payload, elapsedMs });
+        return onTransfer(payload);
       };
-      const transferId = report({ phase: "start", kind, totalBytes: piece.length, url });
+      const transferId = report({ phase: "start", kind, totalBytes: piece.length, url,
+        deadlineAt: Number.isFinite(deadlineAt) ? deadlineAt : null });
       try {
         const response = await nativeFetch(url, {
           method: "GET",
@@ -543,15 +545,13 @@
       return candidates;
     }
 
-    async function downloadPiece(piece, resolver, signal, kind, preferredUrls, startupMode = false, priority = 0, deadlineMs = Infinity) {
+    async function downloadPiece(piece, resolver, signal, kind, preferredUrls, startupMode = false, priority = 0,
+      deadlineAt = Infinity, earlyHedge = null) {
       const settings = config();
       const allowed = (url) => typeof resolver.allows !== "function" || resolver.allows(url);
       const startup = startupMode === true || startupMode === "probe";
       const probe = startupMode === "probe";
       const startedAt = performance.now();
-      const deadlineAt = Number.isFinite(Number(deadlineMs))
-        ? startedAt + Math.max(0, Number(deadlineMs))
-        : Infinity;
       let lastError = null;
 
       // The longest contiguous run of bytes fetched from the front of this piece so far.
@@ -601,20 +601,51 @@
           // for the rest of the hedge delay.
           let firstFailed = () => {};
           const firstFailure = new Promise((resolve) => { firstFailed = resolve; });
+          let firstStarted = () => {};
+          const firstStart = new Promise((resolve) => { firstStarted = resolve; });
+          let firstStartedAt = 0, firstBecameStraggler = () => {};
+          const firstStraggler = new Promise((resolve) => { firstBecameStraggler = resolve; });
+          const observeFirst = event => {
+            if (event.phase !== "progress" || !Number.isFinite(event.etaMs)) return;
+            const missesDeadline = Number.isFinite(deadlineAt)
+              && event.etaMs >= Math.max(0, deadlineAt - performance.now());
+            const slowerThanPeers = meter.connectionBps > 0 && event.bps < meter.connectionBps * 0.5
+              && event.etaMs >= 500;
+            if (Number.isFinite(deadlineAt) && missesDeadline && slowerThanPeers) firstBecameStraggler();
+          };
           const contexts = [];
           const attempts = pair.map((url, pairIndex) => (async () => {
             if (pairIndex) await new Promise((resolve, reject) => {
-              const delay = probe ? 0 : startup
-                ? Math.min(250, hedgeDelayMs(settings, deadlineAt))
-                : hedgeDelayMs(settings, deadlineAt);
-              const timer = setTimeout(resolve, delay);
-              firstFailure.then(() => {
-                clearTimeout(timer);
-                resolve();
+              let timer = null, settled = false, earlyClaimed = false;
+              const finish = (operation) => {
+                if (settled) return;
+                settled = true;
+                if (timer) clearTimeout(timer);
+                controllers[pairIndex].signal.removeEventListener("abort", canceled);
+                operation();
+              };
+              const startTimer = () => {
+                const measured = hedgeDelayMs(settings);
+                const delay = probe ? 0 : startup
+                  ? Math.min(250, measured)
+                  : measured;
+                timer = setTimeout(() => finish(resolve), delay);
+              };
+              // Playback-deadline requests start the hedge clock after the primary
+              // acquires a slot; legacy no-deadline downloads retain main's queue-time
+              // hedge behaviour for compatibility throughput.
+              if (Number.isFinite(deadlineAt)) firstStart.then(startTimer);
+              else startTimer();
+              firstStraggler.then(() => {
+                if (settled || probe || earlyClaimed || !earlyHedge?.claimProgress?.()) return;
+                earlyClaimed = true;
+                if (timer) clearTimeout(timer);
+                const grace = Math.max(0, 250 - (performance.now() - firstStartedAt));
+                timer = setTimeout(() => finish(resolve), grace);
               });
+              firstFailure.then(() => finish(resolve));
               const canceled = () => {
-                clearTimeout(timer);
-                reject(abortError(controllers[pairIndex].signal.reason));
+                finish(() => reject(abortError(controllers[pairIndex].signal.reason)));
               };
               if (controllers[pairIndex].signal.aborted) canceled();
               else controllers[pairIndex].signal.addEventListener("abort", canceled, { once: true });
@@ -624,6 +655,10 @@
             let base = null;
             const recorder = { bytes: 0, chunks: [] };
             const begin = () => {
+              if (!pairIndex) {
+                firstStartedAt = performance.now();
+                firstStarted();
+              }
               base = prefix && prefix.bytes >= RESUME_MIN_BYTES ? prefix : null;
               if (pairIndex) {
                 const live = liveProgress(contexts[0]);
@@ -640,7 +675,7 @@
             };
             try {
               const result = await attempt(piece, url, controllers[pairIndex].signal, kind, resolver,
-                priority + (pairIndex ? 20 : 0), begin, deadlineAt);
+                priority + (pairIndex ? 20 : 0), begin, deadlineAt, pairIndex ? null : observeFirst);
               return base
                 ? { bytes: core.concatChunks([...base.chunks, result.bytes], piece.length), total: result.total, url: result.url }
                 : result;
@@ -841,7 +876,7 @@
         candidateUrls,
         "probe",
         220,
-        options.deadlineMs
+        options.deadlineAt
       );
       await options.onOrderedChunk(headResult.bytes, head, headResult.total);
       if (head.end >= range.end) {
@@ -856,7 +891,8 @@
         };
       }
 
-      const mediaBudget = effectiveConcurrency;
+      const rescueReserve = Math.max(1, Math.min(16, Math.ceil(effectiveConcurrency / 8)));
+      const mediaBudget = Math.max(1, effectiveConcurrency - rescueReserve);
       const audioBudget = Math.max(1, Math.min(mediaBudget, Math.ceil(effectiveConcurrency / 8)));
       const pieceBudget = options.kind === "audio"
         ? audioBudget
@@ -889,6 +925,7 @@
       const measured = typeof resolver.speed === "function" ? (url) => resolver.speed(url) > 0 : () => false;
       const provenUrls = candidateUrls.filter((url) => url === headResult.url || measured(url));
       const primaries = assignPrimaries(provenUrls.length ? provenUrls : [headResult.url], resolver, pieces.length);
+      const earlyHedge = createEarlyHedge(rescueReserve);
       const pendingPieces = pieces.map(async (piece, orderedIndex) => {
         const result = await downloadPiece(
           piece,
@@ -898,7 +935,8 @@
           preferredFor(primaries[orderedIndex], [headResult.url, ...candidateUrls.filter((url) => url !== headResult.url)]),
           true,
           120 - Math.min(30, piece.index),
-          options.deadlineMs
+          options.deadlineAt,
+          earlyHedge
         );
         ordered[orderedIndex] = result;
         await flushOrdered();
@@ -922,9 +960,16 @@
     async function downloadRange(range, resolver, options = {}) {
       const settings = config();
       if (options.kind === "meta") return downloadStartupRange(range, resolver, options);
+      // Resolve one absolute deadline at the range boundary. Every piece, including work
+      // scheduled after the startup probe, refers to the same playback instant.
+      const deadlineAt = Number.isFinite(Number(options.deadlineAt))
+        ? Number(options.deadlineAt)
+        : Number.isFinite(Number(options.deadlineMs))
+          ? performance.now() + Math.max(0, Number(options.deadlineMs))
+          : Infinity;
       const parallel = options.parallel !== false;
       if (options.startup === true && parallel && typeof options.onOrderedChunk === "function") {
-        return downloadStartupMediaRange(range, resolver, options, settings);
+        return downloadStartupMediaRange(range, resolver, { ...options, deadlineAt }, settings);
       }
       const preferredUrls = parallel && typeof resolver.rangeCandidates === "function"
         ? resolver.rangeCandidates()
@@ -934,11 +979,16 @@
         ? Math.max(1, Math.trunc(Number(options.maxConcurrency)))
         : globalConcurrency;
       const effectiveConcurrency = parallel ? Math.min(globalConcurrency, requestedConcurrency) : 1;
+      // Fewer primary pieces than slots is not a hard-reserved connection: it gives a
+      // stalled piece's hedge/retry room to start immediately while the other primaries run.
       semaphore.setLimit(globalConcurrency);
       const basePriority = Number.isFinite(Number(options.priority)) ? Number(options.priority) : 50;
+      const rescueReserve = parallel && effectiveConcurrency >= 8
+        ? Math.min(8, Math.max(1, Math.ceil(effectiveConcurrency / 8)))
+        : 0;
       const pieceConcurrency = options.startup === true
         ? Math.max(1, Math.min(22, effectiveConcurrency))
-        : effectiveConcurrency;
+        : Math.max(1, effectiveConcurrency - rescueReserve);
       const pieces = core.splitRange(
         range.start,
         range.end,
@@ -946,6 +996,7 @@
         parallel ? adaptiveMinChunk(settings, range.length, pieceConcurrency, preferredUrls.length) : Number.MAX_SAFE_INTEGER
       );
       const primaries = parallel ? assignPrimaries(preferredUrls, resolver, pieces.length) : [];
+      const earlyHedge = createEarlyHedge(rescueReserve);
       const progressive = typeof options.onOrderedChunk === "function";
       const ordered = new Array(pieces.length);
       let nextOrderedIndex = 0;
@@ -970,7 +1021,8 @@
           preferredFor(primaries[piece.index], preferredUrls),
           options.startup === true,
           basePriority - Math.min(20, piece.index),
-          options.deadlineMs
+          deadlineAt,
+          earlyHedge
         );
         if (progressive) {
           ordered[piece.index] = result;
