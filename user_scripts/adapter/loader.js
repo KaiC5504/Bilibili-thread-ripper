@@ -34,6 +34,9 @@ else {
   observer.observe(document, { childList: true });
 }
 
-if (typeof GM_registerMenuCommand === "function") {
+// The script now runs in live-site iframes too; the manager menu entry stays one per tab.
+let topLevelFrame = true;
+try { topLevelFrame = window.self === window.top; } catch (_error) {}
+if (typeof GM_registerMenuCommand === "function" && topLevelFrame) {
   GM_registerMenuCommand("线程撕裂者设置", () => document.dispatchEvent(new CustomEvent("btr-userscript-open-settings")));
 }

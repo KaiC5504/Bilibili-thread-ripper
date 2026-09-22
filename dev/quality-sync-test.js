@@ -18,19 +18,27 @@
       return { enabled: value?.enabled !== false, mode: value?.mode || "mainland", concurrency: 32 };
     }
   };
-  // The native player: its menu sets newQ, like Bilibili's own click handler.
-  root.player = { getQuality: () => ({ nowQ: 0, newQ: nativeQuality, realQ: 16 }) };
+  // The native player: its menu sets newQ, like Bilibili's own click handler. Its core
+  // keeps a pending switch that waits for the "rendered" confirmation.
+  let pendingSwitch = null;
+  const resolvedSwitches = [];
+  root.player = {
+    getQuality: () => ({ nowQ: 0, newQ: nativeQuality, realQ: 16 }),
+    __core: () => ({ qnSwitchingInfo: { video: pendingSwitch } })
+  };
   for (const item of document.querySelectorAll(".bpx-player-ctrl-quality-menu-item")) {
     item.addEventListener("click", () => { nativeQuality = Number(item.dataset.value); });
   }
   root.__BILI_NATIVE_MSE_PLAYER_FACTORY__ = {
     createNativePlayer(options) {
       created.push({ preferredQuality: options.preferredQuality });
+      setTimeout(() => options.onState?.({ playerState: "ready", quality: "480P", bufferedAhead: 10, cdnHosts: [] }), 0);
       return {
         applySettings() {},
         async setQuality(quality) { qualityCalls.push({ quality, at: performance.now() }); },
         async updatePlayinfo() {},
         destroy() {},
+        getDebug: () => ({ qualityId: nativeQuality }),
         video: { isConnected: true, paused: false }
       };
     }
@@ -72,6 +80,23 @@
     await wait(1300);
     output.steps.changeWithoutClick = qualityCalls.at(-1)?.quality === 16 && qualityCalls.length === 2;
 
+    // Bilibili's core waits for the "rendered" confirmation of the switch to 16. The
+    // takeover already plays that quality, so the pending switch is resolved for it
+    // within the next sync tick, and the same pending object only once.
+    pendingSwitch = {
+      switching: true, oQn: 32, qn: 16,
+      resolve(payload) { resolvedSwitches.push(payload); pendingSwitch.switching = false; },
+      reject() {}, listener() {}
+    };
+    await wait(2400);
+    output.steps.switchConfirmed = resolvedSwitches.length === 1
+      && resolvedSwitches[0]?.type === "qualityChangeRendered"
+      && resolvedSwitches[0]?.newQuality === 16;
+    pendingSwitch.switching = true;
+    await wait(1300);
+    output.steps.samePendingNotRepeated = resolvedSwitches.length === 1;
+    pendingSwitch = null;
+
     clickedAt = performance.now();
     click(0);
     await wait(150);
@@ -83,9 +108,11 @@
       && output.steps.clickFollowedQuickly
       && output.steps.sameChoiceNotRepeated
       && output.steps.changeWithoutClick
+      && output.steps.switchConfirmed
+      && output.steps.samePendingNotRepeated
       && output.steps.backToAuto
       && output.steps.onePlayer
-      && root.__biliThreadRipperDebug?.version === "0.9.3.0";
+      && root.__biliThreadRipperDebug?.version === "0.9.4.0";
     render();
     result.dataset.pass = String(output.pass);
   })();

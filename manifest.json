@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Bilibili 线程撕裂者",
   "short_name": "线程撕裂者",
-  "version": "0.9.3.0",
+  "version": "0.9.4.0",
   "description": "保留哔哩哔哩原生播放器，通过多 CDN、多 Range 并发下载改善视频缓冲速度。",
   "minimum_chrome_version": "114",
   "permissions": [
@@ -48,13 +48,43 @@
     },
     {
       "matches": [
+        "https://live.bilibili.com/*"
+      ],
+      "js": [
+        "src/range-core.js",
+        "src/live-core.js",
+        "src/runtime-notices.js",
+        "src/settings-panel.js",
+        "src/live-hook.js"
+      ],
+      "run_at": "document_start",
+      "all_frames": true,
+      "world": "MAIN"
+    },
+    {
+      "matches": [
         "https://*.bilibili.com/*"
+      ],
+      "exclude_matches": [
+        "https://live.bilibili.com/*"
       ],
       "js": [
         "src/notification-view.js",
         "src/bridge.js"
       ],
       "run_at": "document_start",
+      "world": "ISOLATED"
+    },
+    {
+      "matches": [
+        "https://live.bilibili.com/*"
+      ],
+      "js": [
+        "src/notification-view.js",
+        "src/bridge.js"
+      ],
+      "run_at": "document_start",
+      "all_frames": true,
       "world": "ISOLATED"
     }
   ]

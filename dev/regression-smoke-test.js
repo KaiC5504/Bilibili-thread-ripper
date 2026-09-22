@@ -20,7 +20,9 @@ const { chromium } = require("playwright");
     ["takeover-mode-test.html", "takeover-mode-result"],
     // Several scenarios that wait for buffer checks and rebuffering, hence the longer limit.
     ["quota-refresh-test.html", "quota-refresh-result", 90000],
-    ["address-refresh-test.html", "address-refresh-result", 40000]
+    ["address-refresh-test.html", "address-refresh-result", 40000],
+    ["live-hook-test.html", "live-hook-result"],
+    ["buffered-shim-test.html", "buffered-shim-result"]
   ];
   try {
     for (let offset = 0; offset < tests.length; offset += 3) {

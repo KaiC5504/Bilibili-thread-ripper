@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>BTR SourceBuffer 垫片回归测试</title>
+</head>
+<body>
+  <div class="bpx-player-container"><video muted></video></div>
+  <pre id="buffered-shim-result">starting</pre>
+  <script src="/src/range-core.js"></script>
+  <script src="/src/cdn-resolver.js"></script>
+  <script src="/src/sidx.js"></script>
+  <script src="/src/idm-downloader.js"></script>
+  <script src="/dev/buffered-shim-test.js"></script>
+  <script src="/src/native-mse-player.js"></script>
+  <script>window.__runBufferedShimTest();</script>
+</body>
+</html>
