@@ -31,15 +31,9 @@
 
 ### 直观速度对比 （墨尔本 运营商Superloop实测）
 
-```mermaid
-xychart-beta
-    title "视频下载速度（MiB/s）"
-    x-axis ["不开启插件", "0.9.1.1", "0.9.2.3", "0.9.3.0", "0.9.4.0"]
-    y-axis "MiB/s" 0 --> 3
-    bar [0.09, 2.53, 2.62, 2.70, 2.88]
-```
+![不同版本的下载速度对比](pics/speed-comparison.png)
 
-在墨尔本 Superloop 宽带上测 [BV1RvMx6XEdd](https://www.bilibili.com/video/BV1RvMx6XEdd) 的 4K AVC，标称码率约 2.54 MiB/s。只测下载：BTR 用默认设置，每个版本测 5 次取中位数。
+测的是一个仅自己可见的几乎无播放的 杜比视界 4K60 视频 （BV1Aou3zjEh1）
 
 ## 安装
 
