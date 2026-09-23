@@ -13,6 +13,7 @@
   const CHANNEL = "__BILI_RANGE_ACCELERATOR_V1__";
   const HOST_ID = "__bilibili_thread_ripper_settings__";
   const DIALOG_ID = "__bilibili_thread_ripper_settings_dialog__";
+  const LAUNCHER_ID = "__bilibili_thread_ripper_launcher__";
   const THREAD_OPTIONS = [4, 8, 16, 32, 64, 128];
   const MAX_CUSTOM_HOSTS = 32;
   const HOST_GROUPS = [["大陆节点", cdn.MAINLAND_HOSTS], ["海外节点", cdn.OVERSEAS_HOSTS]];
@@ -79,6 +80,7 @@
         <div class="notice-row"><label for="live-enabled">直播加速（实验性）</label><label class="switch"><input id="live-enabled" type="checkbox" aria-label="直播加速（实验性）"><span></span></label></div>
         <div class="notice-row"><label for="error-notices">显示错误</label><label class="switch"><input id="error-notices" type="checkbox" aria-label="显示错误"><span></span></label></div>
         <div class="notice-row"><label for="debug-notices">Debug 模式</label><label class="switch"><input id="debug-notices" type="checkbox" aria-label="Debug 模式"><span></span></label></div>
+        <div class="notice-row"><label for="floating-button">悬浮按钮</label><label class="switch"><input id="floating-button" type="checkbox" aria-label="悬浮按钮"><span></span></label></div>
         <fieldset id="debug-filters" class="debug-filters" hidden>
           <legend>显示哪些 Debug 消息</legend>
           <div class="debug-filter-actions"><button id="debug-select-all" type="button">全选</button><button id="debug-select-none" type="button">全不选</button></div>
@@ -165,6 +167,7 @@
     .scale span:last-child { text-align: right; }
     .notice-controls { margin-top: 12px; padding: 14px 16px; border: 1px solid #30343d; border-radius: 8px; background: #20232a; }
     .notice-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; color: #c9ced9; font-size: 13px; }
+    .notice-row .switch { flex: none; }
     .notice-row + .notice-row { margin-top: 14px; }
     .debug-filters { min-width: 0; margin: 16px 0 0; padding: 12px 0 0; border: 0; border-top: 1px solid #343943; }
     .debug-filters[hidden] { display: none; }
@@ -181,6 +184,14 @@
     .btr-close { position: sticky; bottom: 12px; display: block; width: calc(100% - 32px); margin: 0 16px 16px; padding: 8px; border: 1px solid #444b57; border-radius: 6px; background: #292d35; color: #d9dee8; font: inherit; font-size: 13px; cursor: pointer; box-shadow: 0 -6px 12px #17191f; }
     .btr-close:hover { border-color: #fb7299; }
     .btr-close:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
+  `;
+
+  const LAUNCHER_CSS = `
+    .btr-launcher { position: fixed; right: 76px; bottom: 116px; display: grid; place-items: center; width: 44px; height: 44px; padding: 0; border: 0; border-radius: 50%; background: #fb7299; color: #fff; font: 700 13px/1 Inter, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif; letter-spacing: .3px; cursor: grab; opacity: .35; touch-action: none; box-shadow: 0 4px 14px rgba(0, 0, 0, .25); transition: opacity 160ms ease, transform 160ms ease, left 180ms ease, right 180ms ease; }
+    .btr-launcher:hover, .btr-launcher:focus-visible { opacity: 1; transform: scale(1.06); }
+    .btr-launcher:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
+    .btr-launcher.dragging { cursor: grabbing; opacity: 1; transform: scale(1.1); transition: opacity 160ms ease, transform 160ms ease; }
+    @media (max-width: 700px) { .btr-launcher { width: 40px; height: 40px; font-size: 12px; } }
   `;
 
   let current = null;
@@ -231,6 +242,7 @@
     const errorNotices = $("error-notices");
     const debugNotices = $("debug-notices");
     const liveEnabled = $("live-enabled");
+    const floatingButton = $("floating-button");
     const debugFilters = $("debug-filters");
     const debugCategoryInputs = [...shadow.querySelectorAll("[data-debug-category]")];
     const customSection = $("custom-hosts");
@@ -310,6 +322,7 @@
       customHosts = settings.customHosts;
       renderHosts();
       liveEnabled.checked = settings.liveEnabled !== false;
+      floatingButton.checked = settings.floatingButton !== false;
       errorNotices.checked = settings.errorNotices;
       debugNotices.checked = settings.debugNotices;
       debugFilters.hidden = !settings.debugNotices;
@@ -319,6 +332,7 @@
     const saveDebugCategories = () => save({ debugCategories: Object.fromEntries(debugCategoryInputs.map((input) => [input.dataset.debugCategory, input.checked])) });
     enabled.addEventListener("change", () => save({ enabled: enabled.checked }));
     liveEnabled.addEventListener("change", () => save({ liveEnabled: liveEnabled.checked }));
+    floatingButton.addEventListener("change", () => save({ floatingButton: floatingButton.checked }));
     concurrency.addEventListener("input", () => {
       const threads = THREAD_OPTIONS[Number(concurrency.value)];
       setSlider(threads);
@@ -387,11 +401,13 @@
       if (current?.host !== host) return;
       current = null;
       clearInterval(timer);
+      launcher?.apply();
       document.removeEventListener("keydown", onKey, true);
       dialog.remove();
     };
     // Changes made elsewhere (the gear menu, another tab) arrive as new settings.
     current = { host, close, render };
+    launcher?.apply();
     backdrop.addEventListener("click", close);
     closeButton.addEventListener("click", close);
     document.addEventListener("keydown", onKey, true);
@@ -407,10 +423,193 @@
   }
 
   const toggle = () => (current ? current.close() : open());
+
+  // The button in the corner of every bilibili page. The toolbar icon only reaches the pages
+  // the extension runs on, and the userscript manager's menu is not obvious (and on the home
+  // page people do not find it at all), so the panel needs a way in that is always visible.
+  // It hides while the video is fullscreen and while the panel itself is open.
+  const launcher = (() => {
+    if (root.top !== root) return null;
+    const MARGIN = 12;
+    // How far a press has to travel before it counts as dragging rather than a click.
+    const DRAG_SLOP = 4;
+    // Let go this close to the left or right edge and it snaps flush to it; let go anywhere
+    // else and it simply stays where it was put.
+    const SNAP_MS = 72;
+    let host = null;
+    let button = null;
+    let wanted = true;
+    // Where the viewer left it, as shares of the window: 0 means stuck to the left edge, 1 to
+    // the right edge, anything between is a free spot. null: never moved.
+    let leftRatio = null;
+    let topRatio = null;
+    let dragging = null;
+
+    // Bilibili fills the screen in two ways: the browser fullscreen API, and its own 网页全屏,
+    // which only resizes the player inside the page. Rather than follow Bilibili class names,
+    // this asks the picture itself: a video that covers the window is a video being watched
+    // full screen, whichever way it got there.
+    const fullscreen = () => {
+      if (document.fullscreenElement || document.webkitFullscreenElement || document.webkitIsFullScreen) return true;
+      const width = root.innerWidth, height = root.innerHeight;
+      if (!width || !height) return false;
+      for (const video of document.querySelectorAll("video")) {
+        const box = video.getBoundingClientRect();
+        if (box.width >= width * 0.92 && box.height >= height * 0.92) return true;
+      }
+      return false;
+    };
+
+    const clamp = (value, low, high) => Math.min(Math.max(value, low), high);
+
+    // Puts it back where it was left. Without a saved spot it sits where it always did: to the
+    // left of Bilibili's own column of round buttons, near the bottom.
+    function place() {
+      if (!button) return;
+      const size = button.offsetHeight || 44;
+      const width = root.innerWidth || 0, height = root.innerHeight || 0;
+      if (leftRatio === null || topRatio === null) {
+        button.style.top = `${Math.round(Math.max(MARGIN, height - size - 116))}px`;
+        button.style.right = "76px";
+        button.style.left = "auto";
+        button.style.bottom = "auto";
+        return;
+      }
+      button.style.top = `${Math.round(clamp(topRatio * height, MARGIN, Math.max(MARGIN, height - size - MARGIN)))}px`;
+      button.style.bottom = "auto";
+      if (leftRatio >= 1) {
+        button.style.right = `${MARGIN}px`;
+        button.style.left = "auto";
+        return;
+      }
+      button.style.left = `${Math.round(clamp(leftRatio * width, MARGIN, Math.max(MARGIN, width - size - MARGIN)))}px`;
+      button.style.right = "auto";
+    }
+
+    function startDrag(event) {
+      if (event.button !== undefined && event.button !== 0) return;
+      const box = button.getBoundingClientRect();
+      dragging = {
+        pointerId: event.pointerId,
+        grabX: event.clientX - box.left,
+        grabY: event.clientY - box.top,
+        fromX: event.clientX,
+        fromY: event.clientY,
+        moved: false
+      };
+      try { button.setPointerCapture(event.pointerId); } catch (_error) {}
+    }
+
+    function moveDrag(event) {
+      if (!dragging || event.pointerId !== dragging.pointerId) return;
+      if (!dragging.moved && Math.hypot(event.clientX - dragging.fromX, event.clientY - dragging.fromY) < DRAG_SLOP) return;
+      dragging.moved = true;
+      button.classList.add("dragging");
+      const size = button.offsetHeight || 44;
+      const width = root.innerWidth, height = root.innerHeight;
+      // Kept as numbers: where it lands is decided from these, not from a fresh layout
+      // read, which the browser is free to postpone until the pointer is already up.
+      dragging.left = Math.round(clamp(event.clientX - dragging.grabX, MARGIN, width - size - MARGIN));
+      dragging.top = Math.round(clamp(event.clientY - dragging.grabY, MARGIN, height - size - MARGIN));
+      dragging.size = size;
+      button.style.left = `${dragging.left}px`;
+      button.style.top = `${dragging.top}px`;
+      button.style.right = "auto";
+      event.preventDefault();
+    }
+
+    function endDrag(event) {
+      if (!dragging || event.pointerId !== dragging.pointerId) return;
+      const { moved, left = 0, top = 0, size = 44 } = dragging;
+      try { button.releasePointerCapture(dragging.pointerId); } catch (_error) {}
+      dragging = null;
+      button.classList.remove("dragging");
+      if (!moved) return;
+      // Dropped within reach of the left or right edge: snap flush to it, and remember the
+      // edge rather than the pixel, so it stays there whatever the window size. Dropped
+      // anywhere else: it stays exactly where it was put.
+      const width = root.innerWidth || 1;
+      if (left <= SNAP_MS) leftRatio = 0;
+      else if (left + size >= width - SNAP_MS) leftRatio = 1;
+      else leftRatio = clamp(left / width, 0, 1);
+      topRatio = clamp(top / (root.innerHeight || 1), 0, 1);
+      place();
+      post("settings-update", { floatingButtonLeft: leftRatio, floatingButtonTop: topRatio });
+    }
+
+    function mount() {
+      if (host?.isConnected) return;
+      host = document.createElement("div");
+      host.id = LAUNCHER_ID;
+      host.style.cssText = "all:initial!important;position:fixed!important;right:0!important;bottom:0!important;width:0!important;height:0!important;z-index:2147483645!important;";
+      const shadow = host.attachShadow({ mode: "open" });
+      const style = document.createElement("style");
+      style.textContent = LAUNCHER_CSS;
+      button = document.createElement("button");
+      button.type = "button";
+      button.className = "btr-launcher";
+      button.title = "线程撕裂者设置（可以拖动）";
+      button.setAttribute("aria-label", "线程撕裂者设置");
+      button.textContent = "BTR";
+      button.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        // A drag that ended on the button itself must not also open the panel.
+        if (button.dataset.dragged === "true") {
+          button.dataset.dragged = "";
+          return;
+        }
+        toggle();
+      });
+      button.addEventListener("pointerdown", startDrag);
+      button.addEventListener("pointermove", moveDrag);
+      for (const type of ["pointerup", "pointercancel"]) {
+        button.addEventListener(type, (event) => {
+          const moved = Boolean(dragging?.moved);
+          endDrag(event);
+          if (moved) button.dataset.dragged = "true";
+        });
+      }
+      shadow.append(style, button);
+      (document.body || document.documentElement).append(host);
+      place();
+    }
+
+    function apply() {
+      const show = wanted && !fullscreen() && !current;
+      if (!show) {
+        host?.remove();
+        return;
+      }
+      mount();
+      // Bilibili replaces large parts of the page when you navigate; put it back if it went.
+      if (!host.isConnected) (document.body || document.documentElement).append(host);
+      if (!dragging) place();
+    }
+
+    const update = (settings) => {
+      wanted = settings?.floatingButton !== false;
+      // null (never dragged) must stay null: Number(null) is 0, which would pin it to a corner.
+      const ratio = (value) => (value != null && Number(value) >= 0 && Number(value) <= 1 ? Number(value) : null);
+      leftRatio = ratio(settings?.floatingButtonLeft);
+      topRatio = ratio(settings?.floatingButtonTop);
+      apply();
+    };
+    for (const type of ["fullscreenchange", "webkitfullscreenchange"]) document.addEventListener(type, apply, true);
+    root.addEventListener("resize", apply);
+    // A page that swaps its body (the SPA navigations) drops the button with it.
+    setInterval(apply, 2000);
+    if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", apply, { once: true });
+    // The button is on by default, so it is there before the stored settings arrive.
+    apply();
+    return { update, apply };
+  })();
+
   root.addEventListener("message", (event) => {
     if (event.source !== root || event.data?.channel !== CHANNEL) return;
     if (event.data.type === "settings") {
       latestSettings = core.normalizeSettings(event.data.payload);
+      launcher?.update(latestSettings);
       current?.render(latestSettings);
     } else if (event.data.type === "stats") {
       latestStats = event.data.payload;

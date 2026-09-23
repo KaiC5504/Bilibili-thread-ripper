@@ -9,7 +9,7 @@ const { chromium } = require("playwright");
     ["multipart-navigation-test.html", "multipart-navigation-result"],
     ["takeover-error-test.html", "takeover-error-result"],
     ["error-notice-test.html", "error-notice-result"],
-    ["onboarding-test.html", "result"],
+    ["floating-button-test.html", "result"],
     ["mse-abort-test.html", "mse-abort-result"],
     ["quality-sync-test.html", "quality-sync-result"],
     ["info-panel-test.html", "info-panel-result"],

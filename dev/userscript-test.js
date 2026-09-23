@@ -59,25 +59,29 @@ const settingsOf = page => page.evaluate(() => __biliThreadRipperDebug.getSettin
     await page.goto(origin);
     const stored = (target = page) => target.evaluate(() => JSON.parse(localStorage.getItem("BTR_Userscript.sync") || "{}"));
 
-    // First run shows the same welcome panel as the extension, with the 0.9.1.2 defaults.
-    const welcome = page.locator("#__bilibili_thread_ripper_onboarding__");
-    await welcome.waitFor();
-    assert.equal(await welcome.locator('input[name="btr-onboarding-mode"]:checked').getAttribute("value"), "mainland");
-    assert.equal(await welcome.locator(".btr-onboarding-thread-value").textContent(), "8");
-    // 自动线程数 is on by default; the slider is then the manual fallback.
-    assert.equal(await welcome.locator('input[name="btr-onboarding-auto"]').isChecked(), true);
-    assert.equal(await welcome.locator('input[type="range"]').isDisabled(), true);
-    await welcome.locator(".btr-onboarding-save").click();
-    await welcome.waitFor({ state: "detached" });
-    const saved = await stored();
-    assert.deepEqual([saved.enabled, saved.mode, saved.concurrency, saved.autoConcurrency, saved.errorNotices, saved.debugNotices], [true, "mainland", 8, true, false, false]);
+    // No welcome panel any more: in the userscript its "seen" flag lived in each bilibili
+    // domain's own localStorage, so it came back on every domain (issue #26). The settings
+    // are simply the defaults until something changes them.
+    await page.waitForFunction(() => window.__biliThreadRipperDebug?.getSettings().concurrency === 8);
+    assert.equal(await page.locator("#__bilibili_thread_ripper_onboarding__").count(), 0);
+    const settings = await settingsOf(page);
+    assert.deepEqual([settings.enabled, settings.mode, settings.concurrency, settings.autoConcurrency, settings.errorNotices, settings.debugNotices], [true, "mainland", 8, true, false, false]);
+    // The button in the page corner opens the panel, and closes it again.
+    const launcherButton = page.locator("#__bilibili_thread_ripper_launcher__ .btr-launcher");
+    await launcherButton.waitFor();
+    await launcherButton.click();
+    await page.locator(`${settingsHost} .btr-popup`).waitFor();
+    assert.equal(await launcherButton.count(), 0, "悬浮按钮 steps aside while the panel is open");
+    await page.keyboard.press("Escape");
+    await page.locator(settingsHost).waitFor({ state: "detached" });
+    await launcherButton.waitFor();
     assert.equal(await page.evaluate(() => window.chrome?.storage), undefined, "the page's own chrome object must stay untouched");
     // The player menu keeps only what the extension puts there.
     const menu = page.locator("#__bilibili_thread_ripper_native_settings__");
     await menu.waitFor({ state: "attached" });
     assert.deepEqual(await menu.locator(".btr-native-setting-title").allTextContents(), ["线程撕裂者 CDN", "并发线程"]);
     assert.deepEqual(await menu.locator('input[name="btr-native-mode"]').evaluateAll(nodes => nodes.map(node => node.value)), ["mainland", "overseas", "custom"]);
-    console.log("PASS 首次打开显示欢迎设置；播放器菜单保持扩展原样");
+    console.log("PASS 不再弹欢迎设置；页面角落的悬浮按钮能打开设置；播放器菜单保持扩展原样");
 
     // The menu command opens the settings panel inside the bilibili page, the same one the
     // extension's toolbar icon opens.
@@ -179,7 +183,6 @@ const settingsOf = page => page.evaluate(() => __biliThreadRipperDebug.getSettin
     second.on("pageerror", error => errors.push(error.message));
     await second.goto(origin);
     await second.waitForFunction(() => window.__biliThreadRipperDebug?.getSettings().concurrency === 16);
-    assert.equal(await second.locator("#__bilibili_thread_ripper_onboarding__").count(), 0);
     await openSettings(second);
     const secondPanel = second.locator(`${settingsHost} .btr-popup`);
     await secondPanel.waitFor();
@@ -188,7 +191,7 @@ const settingsOf = page => page.evaluate(() => __biliThreadRipperDebug.getSettin
     await page.goto(origin);
     await page.waitForFunction(() => window.__biliThreadRipperDebug?.getSettings().mode === "overseas");
     assert.deepEqual(await settingsOf(page).then(value => [value.concurrency, value.errorNotices, value.debugNotices]), [16, true, true]);
-    console.log("PASS 另一个标签页同步设置，刷新后设置保留，不再弹欢迎设置");
+    console.log("PASS 另一个标签页同步设置，刷新后设置保留");
 
     // "自定义" in the gear menu opens the panel on the custom servers. Known servers are
     // ticked, others typed in; only Bilibili's video servers are taken, and what is typed

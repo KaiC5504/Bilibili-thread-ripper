@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili 线程撕裂者
 // @namespace    https://github.com/MrTangLuyao/Bilibili-thread-ripper
-// @version      0.9.4.1
+// @version      0.9.4.2
 // @description  保留哔哩哔哩原生播放器，通过多 CDN、多 Range 并发下载改善视频缓冲速度。
 // @author       MrTangLuyao
 // @license      MIT
@@ -219,6 +219,13 @@ const chrome = (() => {
         .map(normalizeCdnHost)
         .filter((host, index, all) => host && all.indexOf(host) === index)
         .slice(0, 32),
+      // The round button in the page corner that opens the settings panel, and where the
+      // viewer dragged it: which side, and how far down as a share of the window height.
+      floatingButton: source.floatingButton !== false,
+      // Where the viewer dragged it, as shares of the window (0 = flush left, 1 = flush
+      // right); null when it was never moved.
+      floatingButtonLeft: source.floatingButtonLeft != null && Number(source.floatingButtonLeft) >= 0 && Number(source.floatingButtonLeft) <= 1 ? Number(source.floatingButtonLeft) : null,
+      floatingButtonTop: source.floatingButtonTop != null && Number(source.floatingButtonTop) >= 0 && Number(source.floatingButtonTop) <= 1 ? Number(source.floatingButtonTop) : null,
       debugNotices: source.debugNotices === true,
       errorNotices: source.errorNotices === true,
       debugCategories: Object.fromEntries(["takeover", "playback", "download", "buffer", "settings", "other"].map(key => [key, source.debugCategories?.[key] !== false])),
@@ -3115,7 +3122,7 @@ const chrome = (() => {
       urlDeadlineSeconds,
       video,
       getDebug: () => ({
-        version: "0.9.4.1",
+        version: "0.9.4.2",
         architecture: "bilibili-native-ui-progressive-mse-0.8-core",
         quality: qualityLabel(selectedVideo),
         qualityId: Number(selectedVideo?.id) || 0,
@@ -3909,6 +3916,7 @@ const chrome = (() => {
   const CHANNEL = "__BILI_RANGE_ACCELERATOR_V1__";
   const HOST_ID = "__bilibili_thread_ripper_settings__";
   const DIALOG_ID = "__bilibili_thread_ripper_settings_dialog__";
+  const LAUNCHER_ID = "__bilibili_thread_ripper_launcher__";
   const THREAD_OPTIONS = [4, 8, 16, 32, 64, 128];
   const MAX_CUSTOM_HOSTS = 32;
   const HOST_GROUPS = [["大陆节点", cdn.MAINLAND_HOSTS], ["海外节点", cdn.OVERSEAS_HOSTS]];
@@ -3975,6 +3983,7 @@ const chrome = (() => {
         <div class="notice-row"><label for="live-enabled">直播加速（实验性）</label><label class="switch"><input id="live-enabled" type="checkbox" aria-label="直播加速（实验性）"><span></span></label></div>
         <div class="notice-row"><label for="error-notices">显示错误</label><label class="switch"><input id="error-notices" type="checkbox" aria-label="显示错误"><span></span></label></div>
         <div class="notice-row"><label for="debug-notices">Debug 模式</label><label class="switch"><input id="debug-notices" type="checkbox" aria-label="Debug 模式"><span></span></label></div>
+        <div class="notice-row"><label for="floating-button">悬浮按钮</label><label class="switch"><input id="floating-button" type="checkbox" aria-label="悬浮按钮"><span></span></label></div>
         <fieldset id="debug-filters" class="debug-filters" hidden>
           <legend>显示哪些 Debug 消息</legend>
           <div class="debug-filter-actions"><button id="debug-select-all" type="button">全选</button><button id="debug-select-none" type="button">全不选</button></div>
@@ -4061,6 +4070,7 @@ const chrome = (() => {
     .scale span:last-child { text-align: right; }
     .notice-controls { margin-top: 12px; padding: 14px 16px; border: 1px solid #30343d; border-radius: 8px; background: #20232a; }
     .notice-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; color: #c9ced9; font-size: 13px; }
+    .notice-row .switch { flex: none; }
     .notice-row + .notice-row { margin-top: 14px; }
     .debug-filters { min-width: 0; margin: 16px 0 0; padding: 12px 0 0; border: 0; border-top: 1px solid #343943; }
     .debug-filters[hidden] { display: none; }
@@ -4077,6 +4087,14 @@ const chrome = (() => {
     .btr-close { position: sticky; bottom: 12px; display: block; width: calc(100% - 32px); margin: 0 16px 16px; padding: 8px; border: 1px solid #444b57; border-radius: 6px; background: #292d35; color: #d9dee8; font: inherit; font-size: 13px; cursor: pointer; box-shadow: 0 -6px 12px #17191f; }
     .btr-close:hover { border-color: #fb7299; }
     .btr-close:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
+  `;
+
+  const LAUNCHER_CSS = `
+    .btr-launcher { position: fixed; right: 76px; bottom: 116px; display: grid; place-items: center; width: 44px; height: 44px; padding: 0; border: 0; border-radius: 50%; background: #fb7299; color: #fff; font: 700 13px/1 Inter, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif; letter-spacing: .3px; cursor: grab; opacity: .35; touch-action: none; box-shadow: 0 4px 14px rgba(0, 0, 0, .25); transition: opacity 160ms ease, transform 160ms ease, left 180ms ease, right 180ms ease; }
+    .btr-launcher:hover, .btr-launcher:focus-visible { opacity: 1; transform: scale(1.06); }
+    .btr-launcher:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
+    .btr-launcher.dragging { cursor: grabbing; opacity: 1; transform: scale(1.1); transition: opacity 160ms ease, transform 160ms ease; }
+    @media (max-width: 700px) { .btr-launcher { width: 40px; height: 40px; font-size: 12px; } }
   `;
 
   let current = null;
@@ -4127,6 +4145,7 @@ const chrome = (() => {
     const errorNotices = $("error-notices");
     const debugNotices = $("debug-notices");
     const liveEnabled = $("live-enabled");
+    const floatingButton = $("floating-button");
     const debugFilters = $("debug-filters");
     const debugCategoryInputs = [...shadow.querySelectorAll("[data-debug-category]")];
     const customSection = $("custom-hosts");
@@ -4206,6 +4225,7 @@ const chrome = (() => {
       customHosts = settings.customHosts;
       renderHosts();
       liveEnabled.checked = settings.liveEnabled !== false;
+      floatingButton.checked = settings.floatingButton !== false;
       errorNotices.checked = settings.errorNotices;
       debugNotices.checked = settings.debugNotices;
       debugFilters.hidden = !settings.debugNotices;
@@ -4215,6 +4235,7 @@ const chrome = (() => {
     const saveDebugCategories = () => save({ debugCategories: Object.fromEntries(debugCategoryInputs.map((input) => [input.dataset.debugCategory, input.checked])) });
     enabled.addEventListener("change", () => save({ enabled: enabled.checked }));
     liveEnabled.addEventListener("change", () => save({ liveEnabled: liveEnabled.checked }));
+    floatingButton.addEventListener("change", () => save({ floatingButton: floatingButton.checked }));
     concurrency.addEventListener("input", () => {
       const threads = THREAD_OPTIONS[Number(concurrency.value)];
       setSlider(threads);
@@ -4283,11 +4304,13 @@ const chrome = (() => {
       if (current?.host !== host) return;
       current = null;
       clearInterval(timer);
+      launcher?.apply();
       document.removeEventListener("keydown", onKey, true);
       dialog.remove();
     };
     // Changes made elsewhere (the gear menu, another tab) arrive as new settings.
     current = { host, close, render };
+    launcher?.apply();
     backdrop.addEventListener("click", close);
     closeButton.addEventListener("click", close);
     document.addEventListener("keydown", onKey, true);
@@ -4303,10 +4326,193 @@ const chrome = (() => {
   }
 
   const toggle = () => (current ? current.close() : open());
+
+  // The button in the corner of every bilibili page. The toolbar icon only reaches the pages
+  // the extension runs on, and the userscript manager's menu is not obvious (and on the home
+  // page people do not find it at all), so the panel needs a way in that is always visible.
+  // It hides while the video is fullscreen and while the panel itself is open.
+  const launcher = (() => {
+    if (root.top !== root) return null;
+    const MARGIN = 12;
+    // How far a press has to travel before it counts as dragging rather than a click.
+    const DRAG_SLOP = 4;
+    // Let go this close to the left or right edge and it snaps flush to it; let go anywhere
+    // else and it simply stays where it was put.
+    const SNAP_MS = 72;
+    let host = null;
+    let button = null;
+    let wanted = true;
+    // Where the viewer left it, as shares of the window: 0 means stuck to the left edge, 1 to
+    // the right edge, anything between is a free spot. null: never moved.
+    let leftRatio = null;
+    let topRatio = null;
+    let dragging = null;
+
+    // Bilibili fills the screen in two ways: the browser fullscreen API, and its own 网页全屏,
+    // which only resizes the player inside the page. Rather than follow Bilibili class names,
+    // this asks the picture itself: a video that covers the window is a video being watched
+    // full screen, whichever way it got there.
+    const fullscreen = () => {
+      if (document.fullscreenElement || document.webkitFullscreenElement || document.webkitIsFullScreen) return true;
+      const width = root.innerWidth, height = root.innerHeight;
+      if (!width || !height) return false;
+      for (const video of document.querySelectorAll("video")) {
+        const box = video.getBoundingClientRect();
+        if (box.width >= width * 0.92 && box.height >= height * 0.92) return true;
+      }
+      return false;
+    };
+
+    const clamp = (value, low, high) => Math.min(Math.max(value, low), high);
+
+    // Puts it back where it was left. Without a saved spot it sits where it always did: to the
+    // left of Bilibili's own column of round buttons, near the bottom.
+    function place() {
+      if (!button) return;
+      const size = button.offsetHeight || 44;
+      const width = root.innerWidth || 0, height = root.innerHeight || 0;
+      if (leftRatio === null || topRatio === null) {
+        button.style.top = `${Math.round(Math.max(MARGIN, height - size - 116))}px`;
+        button.style.right = "76px";
+        button.style.left = "auto";
+        button.style.bottom = "auto";
+        return;
+      }
+      button.style.top = `${Math.round(clamp(topRatio * height, MARGIN, Math.max(MARGIN, height - size - MARGIN)))}px`;
+      button.style.bottom = "auto";
+      if (leftRatio >= 1) {
+        button.style.right = `${MARGIN}px`;
+        button.style.left = "auto";
+        return;
+      }
+      button.style.left = `${Math.round(clamp(leftRatio * width, MARGIN, Math.max(MARGIN, width - size - MARGIN)))}px`;
+      button.style.right = "auto";
+    }
+
+    function startDrag(event) {
+      if (event.button !== undefined && event.button !== 0) return;
+      const box = button.getBoundingClientRect();
+      dragging = {
+        pointerId: event.pointerId,
+        grabX: event.clientX - box.left,
+        grabY: event.clientY - box.top,
+        fromX: event.clientX,
+        fromY: event.clientY,
+        moved: false
+      };
+      try { button.setPointerCapture(event.pointerId); } catch (_error) {}
+    }
+
+    function moveDrag(event) {
+      if (!dragging || event.pointerId !== dragging.pointerId) return;
+      if (!dragging.moved && Math.hypot(event.clientX - dragging.fromX, event.clientY - dragging.fromY) < DRAG_SLOP) return;
+      dragging.moved = true;
+      button.classList.add("dragging");
+      const size = button.offsetHeight || 44;
+      const width = root.innerWidth, height = root.innerHeight;
+      // Kept as numbers: where it lands is decided from these, not from a fresh layout
+      // read, which the browser is free to postpone until the pointer is already up.
+      dragging.left = Math.round(clamp(event.clientX - dragging.grabX, MARGIN, width - size - MARGIN));
+      dragging.top = Math.round(clamp(event.clientY - dragging.grabY, MARGIN, height - size - MARGIN));
+      dragging.size = size;
+      button.style.left = `${dragging.left}px`;
+      button.style.top = `${dragging.top}px`;
+      button.style.right = "auto";
+      event.preventDefault();
+    }
+
+    function endDrag(event) {
+      if (!dragging || event.pointerId !== dragging.pointerId) return;
+      const { moved, left = 0, top = 0, size = 44 } = dragging;
+      try { button.releasePointerCapture(dragging.pointerId); } catch (_error) {}
+      dragging = null;
+      button.classList.remove("dragging");
+      if (!moved) return;
+      // Dropped within reach of the left or right edge: snap flush to it, and remember the
+      // edge rather than the pixel, so it stays there whatever the window size. Dropped
+      // anywhere else: it stays exactly where it was put.
+      const width = root.innerWidth || 1;
+      if (left <= SNAP_MS) leftRatio = 0;
+      else if (left + size >= width - SNAP_MS) leftRatio = 1;
+      else leftRatio = clamp(left / width, 0, 1);
+      topRatio = clamp(top / (root.innerHeight || 1), 0, 1);
+      place();
+      post("settings-update", { floatingButtonLeft: leftRatio, floatingButtonTop: topRatio });
+    }
+
+    function mount() {
+      if (host?.isConnected) return;
+      host = document.createElement("div");
+      host.id = LAUNCHER_ID;
+      host.style.cssText = "all:initial!important;position:fixed!important;right:0!important;bottom:0!important;width:0!important;height:0!important;z-index:2147483645!important;";
+      const shadow = host.attachShadow({ mode: "open" });
+      const style = document.createElement("style");
+      style.textContent = LAUNCHER_CSS;
+      button = document.createElement("button");
+      button.type = "button";
+      button.className = "btr-launcher";
+      button.title = "线程撕裂者设置（可以拖动）";
+      button.setAttribute("aria-label", "线程撕裂者设置");
+      button.textContent = "BTR";
+      button.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        // A drag that ended on the button itself must not also open the panel.
+        if (button.dataset.dragged === "true") {
+          button.dataset.dragged = "";
+          return;
+        }
+        toggle();
+      });
+      button.addEventListener("pointerdown", startDrag);
+      button.addEventListener("pointermove", moveDrag);
+      for (const type of ["pointerup", "pointercancel"]) {
+        button.addEventListener(type, (event) => {
+          const moved = Boolean(dragging?.moved);
+          endDrag(event);
+          if (moved) button.dataset.dragged = "true";
+        });
+      }
+      shadow.append(style, button);
+      (document.body || document.documentElement).append(host);
+      place();
+    }
+
+    function apply() {
+      const show = wanted && !fullscreen() && !current;
+      if (!show) {
+        host?.remove();
+        return;
+      }
+      mount();
+      // Bilibili replaces large parts of the page when you navigate; put it back if it went.
+      if (!host.isConnected) (document.body || document.documentElement).append(host);
+      if (!dragging) place();
+    }
+
+    const update = (settings) => {
+      wanted = settings?.floatingButton !== false;
+      // null (never dragged) must stay null: Number(null) is 0, which would pin it to a corner.
+      const ratio = (value) => (value != null && Number(value) >= 0 && Number(value) <= 1 ? Number(value) : null);
+      leftRatio = ratio(settings?.floatingButtonLeft);
+      topRatio = ratio(settings?.floatingButtonTop);
+      apply();
+    };
+    for (const type of ["fullscreenchange", "webkitfullscreenchange"]) document.addEventListener(type, apply, true);
+    root.addEventListener("resize", apply);
+    // A page that swaps its body (the SPA navigations) drops the button with it.
+    setInterval(apply, 2000);
+    if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", apply, { once: true });
+    // The button is on by default, so it is there before the stored settings arrive.
+    apply();
+    return { update, apply };
+  })();
+
   root.addEventListener("message", (event) => {
     if (event.source !== root || event.data?.channel !== CHANNEL) return;
     if (event.data.type === "settings") {
       latestSettings = core.normalizeSettings(event.data.payload);
+      launcher?.update(latestSettings);
       current?.render(latestSettings);
     } else if (event.data.type === "stats") {
       latestStats = event.data.payload;
@@ -4401,7 +4607,7 @@ const chrome = (() => {
   });
 
   const stats = {
-    version: "0.9.4.1",
+    version: "0.9.4.2",
     architecture: "bilibili-native-ui-progressive-mse-0.8-core",
     mode: settings.mode,
     playerState: "waiting",
@@ -5754,7 +5960,7 @@ const chrome = (() => {
           state: stats.playerState, lastError: stats.lastError, player: rest, nodes: stats.cdnHosts.map((item) => ({ ...item })), bannedNodes: cdnBans?.hosts?.() || [], page: pageEvents.slice(), timeline
         }, null, 1);
       },
-      version: "0.9.4.1"
+      version: "0.9.4.2"
     })
   });
   publish();
@@ -6008,7 +6214,7 @@ const chrome = (() => {
 
   // ---- stats for the extension badge and the settings panel ----
   const stats = {
-    version: "0.9.4.1",
+    version: "0.9.4.2",
     architecture: "live-segment-ripper",
     mode: "live",
     playerState: "waiting",
@@ -6472,7 +6678,7 @@ const chrome = (() => {
         hosts: context.pool.status()
       },
       getStats: () => ({ ...stats }),
-      version: "0.9.4.1"
+      version: "0.9.4.2"
     })
   });
   publish();
@@ -6789,244 +6995,20 @@ const chrome = (() => {
   "use strict";
 
   const CHANNEL = "__BILI_RANGE_ACCELERATOR_V1__";
-  const VERSION = "0.9.4.1";
+  const VERSION = "0.9.4.2";
   const notices = globalThis.__BTR_NOTIFICATION_VIEW__;
   const ERROR_NOTICE_ID = "__bilibili_thread_ripper_error_notice__";
   const ERROR_NOTICE_STYLE_ID = "__bilibili_thread_ripper_error_notice_style__";
-  const ONBOARDING_ID = "__bilibili_thread_ripper_onboarding__";
-  const ONBOARDING_STYLE_ID = "__bilibili_thread_ripper_onboarding_style__";
-  const ONBOARDING_STORAGE_KEY = "btrOnboardingRevision";
-  const ONBOARDING_REVISION = "native-progressive-mse-v1";
   const THREAD_OPTIONS = Object.freeze([4, 8, 16, 32, 64, 128]);
-  const DEFAULTS = { enabled: true, liveEnabled: true, concurrency: 8, autoConcurrency: true, takeover: "full", mode: "mainland", customHosts: [], debugNotices: false, errorNotices: false, debugCategories: {} };
-  // Settings of the old ArtPlayer version and of the removed compatibility modes.
-  const RETIRED_KEYS = ["statusNotice", "compatibilityMode", "volume", "danmaku", "danmakuFontSize", "subtitleLanguage", "subtitleLastLanguage"];
+  const DEFAULTS = { enabled: true, liveEnabled: true, concurrency: 8, autoConcurrency: true, takeover: "full", mode: "mainland", customHosts: [], floatingButton: true, floatingButtonLeft: null, floatingButtonTop: null, debugNotices: false, errorNotices: false, debugCategories: {} };
+  // Settings of the old ArtPlayer version, of the removed compatibility modes, and the flag
+  // of the first-run guide that 0.9.4.2 removed.
+  const RETIRED_KEYS = ["statusNotice", "compatibilityMode", "volume", "danmaku", "danmakuFontSize", "subtitleLanguage", "subtitleLastLanguage", "btrOnboardingRevision"];
   let latestSettings = { ...DEFAULTS };
   let latestStats = null;
   let loaded = false;
   let lastBadge = null;
-  let onboardingChecked = false;
   let errorNoticeMotion = null;
-
-  function removeOnboarding() {
-    document.getElementById(ONBOARDING_ID)?.remove();
-    document.getElementById(ONBOARDING_STYLE_ID)?.remove();
-  }
-
-  function mountOnboarding() {
-    if (document.getElementById(ONBOARDING_ID)) return;
-    const mount = document.body || document.documentElement;
-    if (!mount) {
-      document.addEventListener("DOMContentLoaded", mountOnboarding, { once: true });
-      return;
-    }
-
-    const style = document.createElement("style");
-    style.id = ONBOARDING_STYLE_ID;
-    style.textContent = `
-      #${ONBOARDING_ID}{position:fixed!important;inset:0!important;z-index:2147483646!important;display:flex!important;align-items:center!important;justify-content:center!important;padding:16px!important;box-sizing:border-box!important;background:rgba(0,0,0,.62)!important;font-family:"Microsoft YaHei","PingFang SC",Arial,sans-serif!important;color:#18191c!important}
-      #${ONBOARDING_ID} *{box-sizing:border-box!important}
-      #${ONBOARDING_ID} .btr-onboarding-panel{width:min(440px,calc(100vw - 32px))!important;max-height:calc(100vh - 32px)!important;overflow:auto!important;padding:28px!important;border:1px solid #e3e5e7!important;border-radius:12px!important;background:#fff!important;box-shadow:none!important}
-      #${ONBOARDING_ID} .btr-onboarding-heading{display:flex!important;align-items:center!important;justify-content:space-between!important;gap:16px!important;margin:0 0 6px!important}
-      #${ONBOARDING_ID} h2{margin:0!important;font-size:22px!important;line-height:1.35!important;font-weight:700!important;color:#18191c!important}
-      #${ONBOARDING_ID} .btr-onboarding-version{flex:none!important;padding:3px 8px!important;border-radius:5px!important;background:#f1f2f3!important;color:#61666d!important;font-size:12px!important;line-height:18px!important}
-      #${ONBOARDING_ID} .btr-onboarding-lead{margin:0 0 24px!important;color:#61666d!important;font-size:13px!important;line-height:1.7!important}
-      #${ONBOARDING_ID} fieldset{min-width:0!important;margin:0 0 22px!important;padding:0!important;border:0!important}
-      #${ONBOARDING_ID} legend{display:block!important;width:100%!important;margin:0 0 10px!important;padding:0!important;color:#18191c!important;font-size:14px!important;line-height:20px!important;font-weight:600!important}
-      #${ONBOARDING_ID} .btr-onboarding-mode-list{display:grid!important;grid-template-columns:1fr 1fr!important;gap:10px!important}
-      #${ONBOARDING_ID} .btr-onboarding-mode{position:relative!important;display:block!important;cursor:pointer!important}
-      #${ONBOARDING_ID} .btr-onboarding-mode input{position:absolute!important;width:1px!important;height:1px!important;opacity:0!important;pointer-events:none!important}
-      #${ONBOARDING_ID} .btr-onboarding-mode-body{display:block!important;min-height:78px!important;padding:13px!important;border:1px solid #dcdfe3!important;border-radius:8px!important;background:#fff!important;color:#18191c!important;transition:border-color .15s ease,background-color .15s ease!important}
-      #${ONBOARDING_ID} .btr-onboarding-mode input:checked+.btr-onboarding-mode-body{border-color:#fb7299!important;background:#fff1f5!important}
-      #${ONBOARDING_ID} .btr-onboarding-mode input:focus-visible+.btr-onboarding-mode-body{outline:2px solid #00aeec!important;outline-offset:2px!important}
-      #${ONBOARDING_ID} .btr-onboarding-mode-name{display:block!important;margin:0 0 5px!important;font-size:14px!important;line-height:20px!important;font-weight:600!important}
-      #${ONBOARDING_ID} .btr-onboarding-mode-note{display:block!important;color:#9499a0!important;font-size:12px!important;line-height:18px!important;font-weight:400!important}
-      #${ONBOARDING_ID} .btr-onboarding-hint{margin:8px 0 0!important;color:#9499a0!important;font-size:12px!important;line-height:18px!important}
-      #${ONBOARDING_ID} .btr-onboarding-thread-head{display:flex!important;align-items:center!important;justify-content:space-between!important;margin:0 0 6px!important}
-      #${ONBOARDING_ID} .btr-onboarding-thread-value{color:#fb7299!important;font-size:22px!important;line-height:28px!important;font-weight:700!important;font-variant-numeric:tabular-nums!important}
-      #${ONBOARDING_ID} input[type="range"]{display:block!important;width:100%!important;height:24px!important;margin:0!important;accent-color:#fb7299!important;cursor:pointer!important}
-      #${ONBOARDING_ID} .btr-onboarding-auto{display:flex!important;align-items:flex-start!important;gap:8px!important;margin:0 0 12px!important;color:#18191c!important;font-size:13px!important;line-height:18px!important;cursor:pointer!important}
-      #${ONBOARDING_ID} .btr-onboarding-auto input{margin:2px 0 0!important;accent-color:#fb7299!important}
-      #${ONBOARDING_ID} .btr-onboarding-auto-on input[type=range],#${ONBOARDING_ID} .btr-onboarding-auto-on .btr-onboarding-ticks,#${ONBOARDING_ID} .btr-onboarding-auto-on .btr-onboarding-thread-head{opacity:.45!important}
-      #${ONBOARDING_ID} .btr-onboarding-ticks{display:flex!important;justify-content:space-between!important;margin-top:2px!important;color:#9499a0!important;font-size:11px!important;line-height:16px!important}
-      #${ONBOARDING_ID} .btr-onboarding-tip{margin:0 0 18px!important;padding:10px 12px!important;border-radius:7px!important;background:#f6f7f8!important;color:#61666d!important;font-size:12px!important;line-height:18px!important}
-      #${ONBOARDING_ID} .btr-onboarding-save{display:block!important;width:100%!important;height:42px!important;margin:0!important;border:0!important;border-radius:8px!important;background:#fb7299!important;color:#fff!important;font:600 14px/42px "Microsoft YaHei","PingFang SC",Arial,sans-serif!important;text-align:center!important;cursor:pointer!important}
-      #${ONBOARDING_ID} .btr-onboarding-save:hover{background:#fc8bab!important}
-      #${ONBOARDING_ID} .btr-onboarding-save:focus-visible{outline:2px solid #00aeec!important;outline-offset:2px!important}
-      #${ONBOARDING_ID} .btr-onboarding-save:disabled{background:#c9ccd0!important;cursor:default!important}
-      #${ONBOARDING_ID} .btr-onboarding-status{min-height:18px!important;margin:8px 0 0!important;color:#f85a54!important;font-size:12px!important;line-height:18px!important;text-align:center!important}
-      @media(max-width:520px){#${ONBOARDING_ID} .btr-onboarding-panel{padding:22px!important}#${ONBOARDING_ID} .btr-onboarding-mode-list{grid-template-columns:1fr!important}#${ONBOARDING_ID} .btr-onboarding-mode-body{min-height:0!important}}
-    `;
-    (document.head || document.documentElement).append(style);
-
-    const overlay = document.createElement("div");
-    overlay.id = ONBOARDING_ID;
-    overlay.dataset.version = VERSION;
-    overlay.setAttribute("role", "dialog");
-    overlay.setAttribute("aria-modal", "true");
-    overlay.setAttribute("aria-labelledby", "btr-onboarding-title");
-
-    const panel = document.createElement("section");
-    panel.className = "btr-onboarding-panel";
-    const heading = document.createElement("div");
-    heading.className = "btr-onboarding-heading";
-    const title = document.createElement("h2");
-    title.id = "btr-onboarding-title";
-    title.textContent = "Bilibili 线程撕裂者";
-    const version = document.createElement("span");
-    version.className = "btr-onboarding-version";
-    version.textContent = `v${VERSION}`;
-    heading.append(title, version);
-
-    const lead = document.createElement("p");
-    lead.className = "btr-onboarding-lead";
-    lead.textContent = "首次使用请完成加速设置。播放器、弹幕和字幕仍由 B 站原生功能负责，线程撕裂者只优化视频传输。";
-
-    // Two cards to pick from, as for the CDN mode and the takeover mode.
-    const cardList = (inputName, options, selected) => {
-      const list = document.createElement("div");
-      list.className = "btr-onboarding-mode-list";
-      for (const option of options) {
-        const label = document.createElement("label");
-        label.className = "btr-onboarding-mode";
-        const input = document.createElement("input");
-        input.type = "radio";
-        input.name = inputName;
-        input.value = option.value;
-        input.checked = option.value === selected;
-        const body = document.createElement("span");
-        body.className = "btr-onboarding-mode-body";
-        const name = document.createElement("span");
-        name.className = "btr-onboarding-mode-name";
-        name.textContent = option.name;
-        const note = document.createElement("span");
-        note.className = "btr-onboarding-mode-note";
-        note.textContent = option.note;
-        body.append(name, note);
-        label.append(input, body);
-        list.append(label);
-      }
-      return list;
-    };
-
-    const modeFieldset = document.createElement("fieldset");
-    const modeLegend = document.createElement("legend");
-    modeLegend.textContent = "CDN 模式";
-    modeFieldset.append(modeLegend, cardList("btr-onboarding-mode", [
-      { value: "mainland", name: "大陆 CDN（推荐）", note: "优先使用大陆 bilivideo 节点" },
-      { value: "overseas", name: "海外 CDN", note: "优先使用海外及镜像节点" }
-    ], latestSettings.mode));
-
-    const takeoverFieldset = document.createElement("fieldset");
-    const takeoverLegend = document.createElement("legend");
-    takeoverLegend.textContent = "接管方式";
-    const takeoverHint = document.createElement("p");
-    takeoverHint.className = "btr-onboarding-hint";
-    takeoverHint.textContent = "Safari 用户建议使用兼容模式。以后可以在设置面板里随时改。";
-    takeoverFieldset.append(takeoverLegend, cardList("btr-onboarding-takeover", [
-      { value: "full", name: "全接管（推荐）", note: "视频由插件自己来放，下载和缓冲都由插件安排，速度最快" },
-      { value: "compat", name: "兼容模式", note: "当遇到播放问题或设置不生效时，尝试使用兼容模式" }
-    ], latestSettings.takeover), takeoverHint);
-
-    const threadFieldset = document.createElement("fieldset");
-    const autoRow = document.createElement("label");
-    autoRow.className = "btr-onboarding-auto";
-    const autoInput = document.createElement("input");
-    autoInput.type = "checkbox";
-    autoInput.name = "btr-onboarding-auto";
-    autoInput.checked = latestSettings.autoConcurrency !== false;
-    const autoText = document.createElement("span");
-    autoText.textContent = "自动线程数（推荐）：BTR将智能选择需要的线程数。";
-    autoRow.append(autoInput, autoText);
-    const threadHead = document.createElement("div");
-    threadHead.className = "btr-onboarding-thread-head";
-    const threadLegend = document.createElement("legend");
-    threadLegend.textContent = "并发线程";
-    const threadValue = document.createElement("output");
-    threadValue.className = "btr-onboarding-thread-value";
-    const initialThreadIndex = Math.max(0, THREAD_OPTIONS.indexOf(latestSettings.concurrency));
-    threadValue.value = String(THREAD_OPTIONS[initialThreadIndex]);
-    threadValue.textContent = String(THREAD_OPTIONS[initialThreadIndex]);
-    threadHead.append(threadLegend, threadValue);
-    const threadRange = document.createElement("input");
-    threadRange.type = "range";
-    threadRange.min = "0";
-    threadRange.max = String(THREAD_OPTIONS.length - 1);
-    threadRange.step = "1";
-    threadRange.value = String(initialThreadIndex);
-    threadRange.setAttribute("aria-label", "并发线程");
-    threadRange.addEventListener("input", () => {
-      const value = THREAD_OPTIONS[Number(threadRange.value)] || 8;
-      threadValue.value = String(value);
-      threadValue.textContent = String(value);
-    });
-    const ticks = document.createElement("div");
-    ticks.className = "btr-onboarding-ticks";
-    for (const value of THREAD_OPTIONS) {
-      const tick = document.createElement("span");
-      tick.textContent = String(value);
-      ticks.append(tick);
-    }
-    const syncAuto = () => { threadRange.disabled = autoInput.checked; threadFieldset.classList.toggle("btr-onboarding-auto-on", autoInput.checked); };
-    autoInput.addEventListener("change", syncAuto);
-    syncAuto();
-    threadFieldset.append(autoRow, threadHead, threadRange, ticks);
-
-    const tip = document.createElement("p");
-    tip.className = "btr-onboarding-tip";
-    tip.textContent = "推荐大陆 CDN。线程数自动调整时不用管；想固定线程数就关掉自动，8 到 32 之间按需选。以后可在 B 站播放器的 ⚙ 设置中随时修改。";
-    const save = document.createElement("button");
-    save.type = "button";
-    save.className = "btr-onboarding-save";
-    save.textContent = "保存并开始加速";
-    const status = document.createElement("p");
-    status.className = "btr-onboarding-status";
-    status.setAttribute("aria-live", "polite");
-    save.addEventListener("click", () => {
-      const mode = panel.querySelector('input[name="btr-onboarding-mode"]:checked')?.value === "overseas" ? "overseas" : "mainland";
-      const takeover = panel.querySelector('input[name="btr-onboarding-takeover"]:checked')?.value === "compat" ? "compat" : "full";
-      const concurrency = THREAD_OPTIONS[Number(threadRange.value)] || 8;
-      const autoConcurrency = autoInput.checked;
-      save.disabled = true;
-      save.textContent = "正在保存…";
-      latestSettings = normalizeStoredSettings({ ...latestSettings, enabled: true, mode, takeover, concurrency, autoConcurrency });
-      chrome.storage.sync.set({ enabled: true, mode, takeover, concurrency, autoConcurrency }, () => {
-        if (chrome.runtime.lastError) {
-          status.textContent = `保存失败：${chrome.runtime.lastError.message}`;
-          save.disabled = false;
-          save.textContent = "重新保存";
-          return;
-        }
-        chrome.storage.local.set({ [ONBOARDING_STORAGE_KEY]: ONBOARDING_REVISION }, () => {
-          if (chrome.runtime.lastError) {
-            status.textContent = `保存失败：${chrome.runtime.lastError.message}`;
-            save.disabled = false;
-            save.textContent = "重新保存";
-            return;
-          }
-          loaded = true;
-          postSettings();
-          notices?.configure(latestSettings);
-          updateBadge();
-          removeOnboarding();
-        });
-      });
-    });
-
-    panel.append(heading, lead, modeFieldset, takeoverFieldset, threadFieldset, tip, save, status);
-    overlay.append(panel);
-    mount.append(overlay);
-    save.focus({ preventScroll: true });
-  }
-
-  function showOnboardingIfNeeded() {
-    if (onboardingChecked || window.top !== window) return;
-    onboardingChecked = true;
-    chrome.storage.local.get({ [ONBOARDING_STORAGE_KEY]: "" }, (stored) => {
-      if (stored?.[ONBOARDING_STORAGE_KEY] === ONBOARDING_REVISION) return;
-      setTimeout(mountOnboarding, 350);
-    });
-  }
 
   // The page checks each custom server again with the full rules before using it; here it
   // only has to look like a host name.
@@ -7043,6 +7025,9 @@ const chrome = (() => {
         .map((host) => String(host).trim().toLowerCase())
         .filter((host, index, all) => /^[a-z\d](?:[a-z\d.-]{0,251}[a-z\d])?$/.test(host) && all.indexOf(host) === index)
         .slice(0, 32),
+      floatingButton: input?.floatingButton !== false,
+      floatingButtonLeft: input?.floatingButtonLeft != null && Number(input.floatingButtonLeft) >= 0 && Number(input.floatingButtonLeft) <= 1 ? Number(input.floatingButtonLeft) : null,
+      floatingButtonTop: input?.floatingButtonTop != null && Number(input.floatingButtonTop) >= 0 && Number(input.floatingButtonTop) <= 1 ? Number(input.floatingButtonTop) : null,
       debugNotices: input?.debugNotices === true,
       errorNotices: input?.errorNotices === true,
       debugCategories: Object.fromEntries(["takeover", "playback", "download", "buffer", "settings", "other"].map(key => [key, input?.debugCategories?.[key] !== false]))
@@ -7226,7 +7211,6 @@ const chrome = (() => {
     syncTakeoverErrorNotice();
     updateBadge();
     postSettings();
-    showOnboardingIfNeeded();
   });
 
   chrome.storage.onChanged.addListener((changes, areaName) => {

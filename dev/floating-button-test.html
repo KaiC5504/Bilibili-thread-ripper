@@ -2,10 +2,15 @@
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
-  <title>BTR 0.9.4.1 首次引导测试</title>
+  <title>BTR 0.9.4.2 悬浮按钮测试</title>
 </head>
 <body>
-  <main><h1>模拟 B 站页面</h1><pre id="result">testing</pre></main>
+  <main>
+    <h1>模拟 B 站页面</h1>
+    <!-- The player container: its data-screen is how Bilibili marks its own 网页全屏. -->
+    <div class="bpx-player-container" data-screen="normal"><video></video></div>
+    <pre id="result">testing</pre>
+  </main>
   <script>
     (() => {
       const syncState = {};
@@ -40,7 +45,11 @@
       };
     })();
   </script>
+  <script src="/src/range-core.js"></script>
+  <script src="/src/cdn-resolver.js"></script>
+  <script src="/src/settings-panel.js"></script>
+  <script src="/src/notification-view.js"></script>
   <script src="/src/bridge.js"></script>
-  <script src="/dev/onboarding-test.js"></script>
+  <script src="/dev/floating-button-test.js"></script>
 </body>
 </html>
