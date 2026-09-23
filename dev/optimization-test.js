@@ -5,8 +5,9 @@ const {test}=require("node:test"),assert=require("node:assert/strict"),fs=requir
 const SOURCE=process.env.BTR_TEST_SOURCE
   ? path.resolve(process.env.BTR_TEST_SOURCE)
   : fs.existsSync(path.join(__dirname,"../shared/range-core.js"))?path.join(__dirname,"../shared"):path.join(__dirname,"../src");
-function load(){
-  const context=vm.createContext({URL,AbortController,DOMException,Response,ReadableStream,Headers,Uint8Array,Promise,setTimeout,clearTimeout,performance,console});
+// clock: what the downloader sees as performance (a test can move it ahead).
+function load(clock=performance){
+  const context=vm.createContext({URL,AbortController,DOMException,Response,ReadableStream,Headers,Uint8Array,Promise,setTimeout,clearTimeout,performance:clock,console});
   context.globalThis=context;
   context.__now=1e12;
   vm.runInContext("Date.now=()=>globalThis.__now;",context);
@@ -467,4 +468,247 @@ test("metadata priority stays ahead of media regardless of media deadlines",{tim
   const drain=setInterval(()=>{while(pending.length)pending.shift()();},10);
   await Promise.all([blocker,media,meta]);
   clearInterval(drain);
+});
+
+test("a second copy waits until the first copy has a connection",{timeout:30000},async()=>{
+  // A piece the player needs now (deadline 0). All eight connections held by other ranges for
+  // 1.5 s. The queued piece's second copy used to
+  // count its delay from the queue and then took the connection before its own first copy.
+  const {idm}=load();
+  const HOLD="upos-sz-mirrorbos.bilivideo.com",FIRST="upos-sz-mirrorali.bilivideo.com",SECOND="upos-sz-mirrorhw.bilivideo.com";
+  const requests=[];
+  const nativeFetch=async(url,init)=>{
+    const host=new URL(url).hostname,{start,end}=rangeOf(init);
+    requests.push(host);
+    if(host===HOLD) await new Promise(resolve=>setTimeout(resolve,1500));
+    return ok(start,end,64*1024*1024);
+  };
+  const single=[mediaUrl(HOLD)],pair=[mediaUrl(FIRST),mediaUrl(SECOND)];
+  const resolverOf=urls=>({urls:()=>urls,ordered:()=>urls,rescueCandidates:()=>urls.slice(1),rangeCandidates:()=>urls,allows:()=>true,success(){},failure(){},speed:()=>0});
+  const downloader=idm.createDownloader({getSettings:()=>({concurrency:8}),nativeFetch});
+  const held=Promise.all(Array.from({length:8},(_,index)=>downloader.downloadRange({start:index*64*1024,end:(index+1)*64*1024-1,length:64*1024},resolverOf(single),{parallel:true,kind:"video",maxConcurrency:1})));
+  await new Promise(resolve=>setTimeout(resolve,20));
+  const queued=downloader.downloadRange({start:0,end:64*1024-1,length:64*1024},resolverOf(pair),{parallel:true,kind:"video",maxConcurrency:1,deadlineMs:0});
+  await Promise.all([held,queued]);
+  assert.deepEqual(requests,[...Array(8).fill(HOLD),FIRST],"the queued piece started with its first copy and needed no second one");
+});
+
+test("a piece well on time for playback gets no second copy, a late one does",{timeout:30000},async()=>{
+  // The first copy keeps sending 8 KiB every 200 ms: 64 KiB in about 1.4 s.
+  const {idm}=load();
+  const FIRST="upos-sz-mirrorali.bilivideo.com",SECOND="upos-sz-mirrorhw.bilivideo.com";
+  const all=[mediaUrl(FIRST),mediaUrl(SECOND)];
+  const resolver={urls:()=>all,ordered:()=>all,rescueCandidates:()=>all.slice(1),rangeCandidates:()=>all,allows:()=>true,success(){},failure(){},speed:()=>0};
+  async function run(deadlineMs){
+    const requests=[];
+    const nativeFetch=async(url,init)=>{
+      const host=new URL(url).hostname,{start,end}=rangeOf(init);
+      requests.push(host);
+      if(host!==FIRST) return ok(start,end,64*1024*1024);
+      return stepped(start,end,[[8*1024,0],...Array(7).fill([8*1024,200])],init.signal);
+    };
+    const downloader=idm.createDownloader({getSettings:()=>({concurrency:8}),nativeFetch});
+    const result=await downloader.downloadRange({start:0,end:64*1024-1,length:64*1024},resolver,{parallel:true,kind:"video",maxConcurrency:1,deadlineMs});
+    assert.equal(result.bytes.length,64*1024);
+    return requests;
+  }
+  assert.deepEqual(await run(20000),[FIRST],"due in 20 s and arriving in about 2 s: no copy");
+  assert.deepEqual(await run(1000),[FIRST,SECOND],"due in 1 s: the copy starts");
+  assert.deepEqual(await run(undefined),[FIRST,SECOND],"no deadline: the copy starts after the usual delay");
+});
+
+// A 206 body sent in steps: [[byte count, ms after the previous step], ...]; the rest never comes.
+function stepped(start,end,steps,signal){
+  const bytes=pattern(start,end-start+1),timers=[];
+  const body=new ReadableStream({start(controller){
+    let sent=0,at=0;
+    for(const [count,after] of steps){
+      at+=after;
+      const from=sent,to=Math.min(bytes.length,sent+count);sent=to;
+      timers.push(setTimeout(()=>{try{controller.enqueue(bytes.slice(from,to));if(to>=bytes.length)controller.close();}catch(_){}} ,at));
+    }
+  },cancel(){timers.forEach(clearTimeout);}});
+  signal?.addEventListener("abort",()=>timers.forEach(clearTimeout),{once:true});
+  return new Response(body,{status:206,headers:{"Content-Range":`bytes ${start}-${end}/${64*1024*1024}`}});
+}
+
+test("a piece on pace gets a copy only on a node known to be faster or not measured yet",{timeout:30000},async()=>{
+  // A piece due in 2.4 s that needs about 1.6 s: close enough that the deadline alone does
+  // not decide, with every connection taken.
+  const {idm}=load();
+  const FIRST="upos-sz-mirrorali.bilivideo.com",SECOND="upos-sz-mirrorhw.bilivideo.com",HOLD="upos-sz-mirrorbos.bilivideo.com";
+  const holdersGone=new AbortController();
+  const all=[mediaUrl(FIRST),mediaUrl(SECOND)];
+  let copySpeed=0;
+  const resolver={urls:()=>all,ordered:()=>all,rescueCandidates:()=>all.slice(1),rangeCandidates:()=>all,allows:()=>true,success(){},failure(){},
+    // Both nodes report the same measured speed, so whichever carries the copy has it.
+    speed:()=>copySpeed};
+  let mode="warm";
+  const requests=[];
+  const nativeFetch=async(url,init)=>{
+    const {start,end}=rangeOf(init);
+    if(new URL(url).hostname===HOLD) return new Promise((resolve,reject)=>init.signal.addEventListener("abort",()=>reject(new DOMException("gone","AbortError")),{once:true}));
+    requests.push(new URL(url).hostname);
+    // The first request of each download is its first copy; a later one is the copy. The copy
+    // runs at the usual speed too, so the first copy finishes first and the measured usual
+    // speed stays what it was.
+    if(requests.length>1) return stepped(start,end,[[8*1024,0],...Array(15).fill([8*1024,200])],init.signal);
+    // Warm-up: 64 KiB in 1.5 s, so connections usually run at about 43 KiB/s.
+    if(mode==="warm") return stepped(start,end,[[16*1024,0],[16*1024,500],[16*1024,500],[16*1024,500]],init.signal);
+    // Steady 8 KiB every 200 ms, about 40 KiB/s: the usual speed.
+    if(mode==="pace") return stepped(start,end,[[8*1024,0],...Array(7).fill([8*1024,200])],init.signal);
+    // 4 KiB every 200 ms, about 20 KiB/s: well below the usual speed.
+    return stepped(start,end,[[4*1024,0],...Array(15).fill([4*1024,200])],init.signal);
+  };
+  const downloader=idm.createDownloader({getSettings:()=>({concurrency:4}),nativeFetch});
+  const piece=index=>({start:index*64*1024,end:(index+1)*64*1024-1,length:64*1024});
+  // Warm-up on one node only, so no copy finishes it faster than the usual speed.
+  const alone={...resolver,urls:()=>all.slice(0,1),ordered:()=>all.slice(0,1),rescueCandidates:()=>[],rangeCandidates:()=>all.slice(0,1)};
+  for(const index of [0,1]){
+    requests.length=0;
+    await downloader.downloadRange(piece(index),alone,{parallel:true,kind:"video",maxConcurrency:1});
+  }
+  // Three of the four connections stay taken (cancelled, never completed: a completed one
+  // would change the measured usual speed); the piece takes the fourth.
+  const held=[mediaUrl(HOLD)],holder={...resolver,urls:()=>held,ordered:()=>held,rescueCandidates:()=>[],rangeCandidates:()=>held,speed:()=>0};
+  const holders=[10,11,12].map(index=>downloader.downloadRange(piece(index),holder,{parallel:true,kind:"video",maxConcurrency:1,signal:holdersGone.signal}).catch(()=>{}));
+  await new Promise(resolve=>setTimeout(resolve,20));
+  async function run(index,nextMode,speed){
+    mode=nextMode;copySpeed=speed;requests.length=0;
+    await downloader.downloadRange(piece(index),resolver,{parallel:true,kind:"video",maxConcurrency:1,deadlineMs:2400});
+    return requests.length;
+  }
+  assert.equal(await run(2,"pace",40*1024),1,"on pace, the copy's node known to be as fast: no copy");
+  assert.equal(await run(3,"pace",120*1024),2,"on pace, the copy's node known to be three times faster than this first copy: copy");
+  assert.equal(await run(4,"pace",0),2,"on pace, the copy's node not measured yet: copy");
+  assert.equal(await run(5,"slow",40*1024),2,"half the usual speed: copy");
+  holdersGone.abort();
+  await Promise.all(holders);
+});
+
+test("a deadline that moves closer while a piece downloads still brings its copy",{timeout:30000},async()=>{
+  // The player passes the time left as a function. The segment plays at 20 s; the playhead
+  // runs at 1x, then at 3x from 1.2 s on. The first copy keeps sending 4 KiB every 100 ms and
+  // needs about 6.4 s for its 256 KiB: plenty of time at 1x, too late at 3x.
+  const {idm}=load();
+  const FIRST="upos-sz-mirrorali.bilivideo.com",SECOND="upos-sz-mirrorhw.bilivideo.com";
+  const all=[mediaUrl(FIRST),mediaUrl(SECOND)];
+  const resolver={urls:()=>all,ordered:()=>all,rescueCandidates:()=>all.slice(1),rangeCandidates:()=>all,allows:()=>true,success(){},failure(){},speed:()=>0};
+  const requests=[];
+  const nativeFetch=async(url,init)=>{
+    const {start,end}=rangeOf(init);
+    requests.push({host:new URL(url).hostname,at:Date.now()-began});
+    if(requests.length>1) return ok(start,end,64*1024*1024);
+    return stepped(start,end,[[4*1024,0],...Array(63).fill([4*1024,100])],init.signal);
+  };
+  const downloader=idm.createDownloader({getSettings:()=>({concurrency:8}),nativeFetch});
+  const began=Date.now();
+  const playhead=()=>{const t=(Date.now()-began)/1000;return t<1.2?t:1.2+(t-1.2)*3;};
+  const left=()=>Math.max(0,20-playhead())*1000/((Date.now()-began)<1200?1:3);
+  await downloader.downloadRange({start:0,end:256*1024-1,length:256*1024},resolver,{parallel:true,kind:"video",maxConcurrency:1,deadlineMs:left});
+  assert.equal(requests.length,2,"the copy starts");
+  assert.ok(requests[1].at>=1150,`no copy while the deadline was far: ${requests[1].at} ms`);
+  assert.ok(Date.now()-began<3000,`finished long before the first copy would have: ${Date.now()-began} ms`);
+});
+
+test("an instant answer to the startup probe stops the other candidates before they ask",{timeout:30000},async()=>{
+  const {idm}=load();
+  const hosts=["upos-sz-mirrorali.bilivideo.com","upos-sz-mirrorhw.bilivideo.com","upos-sz-mirrorbos.bilivideo.com","upos-sz-mirror08c.bilivideo.com"];
+  const all=hosts.map(mediaUrl),requests=[];
+  const resolver={urls:()=>all,ordered:()=>all,rescueCandidates:()=>all.slice(1),rangeCandidates:()=>all,startupCandidates:()=>all,allows:()=>true,success(){},failure(){},speed:()=>0};
+  const nativeFetch=async(url,init)=>{const {start,end}=rangeOf(init);requests.push(new URL(url).hostname);return ok(start,end,64*1024*1024);};
+  const downloader=idm.createDownloader({getSettings:()=>({concurrency:8}),nativeFetch});
+  await downloader.downloadRange({start:0,end:64*1024-1,length:64*1024},resolver,{parallel:true,kind:"video",startup:true,onOrderedChunk:async()=>{}});
+  assert.equal(requests.length,1,`probe requests: ${requests.join(", ")}`);
+});
+
+test("a player request that has waited long goes before a newer one of slightly higher priority",{timeout:30000},async()=>{
+  // Only requests with a playback deadline age; the ones here are due in 30 s.
+  const {idm}=load();
+  const HOST="upos-sz-mirrorali.bilivideo.com",only=[mediaUrl(HOST)];
+  const resolver={urls:()=>only,ordered:()=>only,rescueCandidates:()=>[],rangeCandidates:()=>only,allows:()=>true,success(){},failure(){},speed:()=>0};
+  const started=[],pending=[];
+  const nativeFetch=async(url,init)=>{
+    const {start,end}=rangeOf(init);
+    started.push(start);
+    await new Promise(resolve=>pending.push(resolve));
+    return ok(start,end,64*1024*1024);
+  };
+  const downloader=idm.createDownloader({getSettings:()=>({concurrency:8}),nativeFetch});
+  const piece=index=>({start:index*64*1024,end:(index+1)*64*1024-1,length:64*1024});
+  const busy=Array.from({length:8},(_,index)=>downloader.downloadRange(piece(index),resolver,{parallel:true,kind:"video",maxConcurrency:1,priority:50}));
+  await new Promise(resolve=>setTimeout(resolve,20));
+  const old=downloader.downloadRange(piece(20),resolver,{parallel:true,kind:"video",maxConcurrency:1,priority:40,deadlineMs:30000});
+  await new Promise(resolve=>setTimeout(resolve,1500));
+  const fresh=downloader.downloadRange(piece(30),resolver,{parallel:true,kind:"video",maxConcurrency:1,priority:50,deadlineMs:30000});
+  await new Promise(resolve=>setTimeout(resolve,20));
+  pending.shift()();
+  for(let tick=0;started.length<9&&tick<100;tick+=1) await new Promise(resolve=>setTimeout(resolve,5));
+  assert.equal(started[8],20*64*1024,"the piece queued 1.5 s ago starts first");
+  while(started.length<10||pending.length){while(pending.length)pending.shift()();await new Promise(resolve=>setTimeout(resolve,5));}
+  await Promise.all([...busy,old,fresh]);
+});
+
+test("waiting media never goes before init, index or startup requests",{timeout:30000},async()=>{
+  // Ordinary media gains priority while it waits; after 8 s it would outrank even 220.
+  const clock={ahead:0,now(){return performance.now()+this.ahead;}};
+  const {idm}=load(clock);
+  const HOST="upos-sz-mirrorali.bilivideo.com",only=[mediaUrl(HOST)];
+  const resolver={urls:()=>only,ordered:()=>only,rescueCandidates:()=>[],rangeCandidates:()=>only,startupCandidates:()=>only,allows:()=>true,success(){},failure(){},speed:()=>0};
+  const started=[],pending=[];
+  const nativeFetch=async(url,init)=>{
+    const {start,end}=rangeOf(init);
+    started.push(start);
+    await new Promise(resolve=>pending.push(resolve));
+    return ok(start,end,64*1024*1024);
+  };
+  const downloader=idm.createDownloader({getSettings:()=>({concurrency:8}),nativeFetch});
+  const piece=index=>({start:index*64*1024,end:(index+1)*64*1024-1,length:64*1024});
+  const busy=Array.from({length:8},(_,index)=>downloader.downloadRange(piece(index),resolver,{parallel:true,kind:"video",maxConcurrency:1,priority:50}));
+  await new Promise(resolve=>setTimeout(resolve,20));
+  const old=downloader.downloadRange(piece(20),resolver,{parallel:true,kind:"video",maxConcurrency:1,priority:50,deadlineMs:30000});
+  await new Promise(resolve=>setTimeout(resolve,20));
+  clock.ahead+=8000;
+  const meta=downloader.downloadRange(piece(40),resolver,{parallel:false,kind:"meta"});
+  await new Promise(resolve=>setTimeout(resolve,20));
+  pending.shift()();
+  for(let tick=0;started.length<9&&tick<100;tick+=1) await new Promise(resolve=>setTimeout(resolve,5));
+  assert.equal(started[8],40*64*1024,"the index request starts before media that waited 8 s");
+  while(pending.length||started.length<10){while(pending.length)pending.shift()();await new Promise(resolve=>setTimeout(resolve,5));}
+  await Promise.all([...busy,old,meta]);
+});
+
+test("an overdue piece still tries a node whose slow measurement may be stale",{timeout:30000},async()=>{
+  // The copy's node was measured slow a minute ago and has recovered since. The first copy is
+  // at the usual speed and misses the deadline only slightly, so the early straggler rescue
+  // (which needs the first copy to be far behind) does not fire: the piece spends one of the
+  // range's rescue slots on that node anyway instead of carrying on alone.
+  const {idm}=load();
+  const FIRST="upos-sz-mirrorali.bilivideo.com",SECOND="upos-sz-mirrorhw.bilivideo.com";
+  const all=[mediaUrl(FIRST),mediaUrl(SECOND)];
+  const resolver={urls:()=>all,ordered:()=>all,rescueCandidates:()=>all.slice(1),rangeCandidates:()=>all,allows:()=>true,success(){},failure(){},
+    // The first node is the known-good one and carries the piece; the copy's node keeps a
+    // slow measurement from a minute ago.
+    speed:url=>new URL(url).hostname===SECOND?4*1024:50*1024};
+  const requests=[];
+  const nativeFetch=async(url,init)=>{
+    const {start,end}=rangeOf(init);
+    requests.push({host:new URL(url).hostname,at:Date.now()-began});
+    // The first request of the piece trickles at about the usual speed; the recovered node answers at once.
+    if(requests.length>1) return ok(start,end,64*1024*1024);
+    return stepped(start,end,[[8*1024,0],...Array(31).fill([8*1024,200])],init.signal);
+  };
+  const downloader=idm.createDownloader({getSettings:()=>({concurrency:8}),nativeFetch});
+  const alone={...resolver,urls:()=>all.slice(0,1),ordered:()=>all.slice(0,1),rescueCandidates:()=>[],rangeCandidates:()=>all.slice(0,1)};
+  let began=Date.now();
+  // Warm-up on the first node only: about 43 KiB/s counts as the usual connection speed.
+  for(const index of [0,1]){
+    requests.length=0;
+    await downloader.downloadRange({start:index*64*1024,end:(index+1)*64*1024-1,length:64*1024},alone,{parallel:true,kind:"video",maxConcurrency:1});
+  }
+  requests.length=0;began=Date.now();
+  // 64 KiB at about 40 KiB/s needs some 1.6 s; due in 1.4 s, so it is about 200 ms short.
+  await downloader.downloadRange({start:10*64*1024,end:11*64*1024-1,length:64*1024},resolver,{parallel:true,kind:"video",maxConcurrency:1,deadlineMs:1400});
+  assert.equal(requests.length,2,`the copy starts (${requests.map(item=>item.host+"@"+item.at).join(", ")})`);
+  assert.ok(Date.now()-began<2500,`finished without waiting for a timeout: ${Date.now()-began} ms`);
 });

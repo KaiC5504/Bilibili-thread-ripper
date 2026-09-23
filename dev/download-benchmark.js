@@ -58,20 +58,25 @@ const TICK_MS = 20;
 function makeNetwork(profiles, linkBps) {
   const stats = { requests: 0, bytesSent: 0, perHost: new Map(), busyTicks: 0, busyHosts: 0 };
   const pools = new Map();
+  // Bytes are handed out for the time that really passed: timers fire late on a busy
+  // machine, and a fixed TICK_MS share per callback then gives much less than the profile.
+  let lastTick = performance.now();
   const timer = setInterval(() => {
+    const tickNow = performance.now(), tickMs = Math.min(200, tickNow - lastTick);
+    lastTick = tickNow;
     const wants = [];
     for (const [host, streams] of pools) {
       const flowing = [...streams].filter((stream) => stream.flowing());
       if (!flowing.length) continue;
       const profile = profiles[host];
-      const share = Math.min(profile.bps * TICK_MS / 1000 / flowing.length, profile.capBps ? profile.capBps * TICK_MS / 1000 : Infinity);
+      const share = Math.min(profile.bps * tickMs / 1000 / flowing.length, profile.capBps ? profile.capBps * tickMs / 1000 : Infinity);
       for (const stream of flowing) wants.push({ host, stream, size: share });
     }
     if (!wants.length) return;
     stats.busyTicks += 1;
     stats.busyHosts += new Set(wants.map((item) => item.host)).size;
     const total = wants.reduce((sum, item) => sum + item.size, 0);
-    const scale = linkBps && total > linkBps * TICK_MS / 1000 ? (linkBps * TICK_MS / 1000) / total : 1;
+    const scale = linkBps && total > linkBps * tickMs / 1000 ? (linkBps * tickMs / 1000) / total : 1;
     for (const item of wants) item.stream.deliver(Math.max(1, Math.floor(item.size * scale)));
   }, TICK_MS);
   const nativeFetch = async (url, init) => {

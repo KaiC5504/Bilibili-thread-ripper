@@ -478,10 +478,11 @@
     }
 
     function segmentDownload(candidate, track, segment, index, downloadOptions = {}) {
-      const current = Number(video.currentTime) || candidate.startTime;
+      // Read again at every check of the downloader: a new playback rate, or the playhead
+      // standing still during a stall, moves the deadline of pieces already on their way.
       const deadlineAt = Number.isFinite(Number(downloadOptions.deadlineAt))
         ? Number(downloadOptions.deadlineAt)
-        : playbackDeadlineAt(segment.startTime, current, video.playbackRate);
+        : () => playbackDeadlineAt(segment.startTime, Number(video.currentTime) || candidate.startTime, video.playbackRate);
       return downloader.downloadRange(segment, track.resolver, {
         signal: generationSignal(candidate),
         parallel: true,
@@ -1196,7 +1197,7 @@
       urlDeadlineSeconds,
       video,
       getDebug: () => ({
-        version: "0.9.4.0",
+        version: "0.9.4.1",
         architecture: "bilibili-native-ui-progressive-mse-0.8-core",
         quality: qualityLabel(selectedVideo),
         qualityId: Number(selectedVideo?.id) || 0,

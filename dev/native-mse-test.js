@@ -180,7 +180,7 @@
     nativeSourceChanges: probe.nativeSourceChanges,
     errors: probe.errors
   };
-  output.pass = output.version === "0.9.4.0"
+  output.pass = output.version === "0.9.4.1"
     && output.architecture === "bilibili-native-ui-progressive-mse-0.8-core"
     && output.originalUiCount === 1
     && output.videoCount === 1

@@ -8,6 +8,19 @@
   const PIECE_RETRY_WINDOW_MS = 25000;
   // Below this a resumed request saves less than its own round trip costs.
   const RESUME_MIN_BYTES = 32 * 1024;
+  // Hedging a piece with a playback deadline (see hedgeDue): a first copy projected to finish
+  // this long before the deadline gets no copy yet; one receiving at least HEDGE_PACE of the
+  // usual connection speed is on pace; a copy's node measured HEDGE_FASTER times faster than the
+  // first copy is receiving is worth a copy anyway.
+  const HEDGE_SLACK_MS = 1500;
+  const HEDGE_PACE = 0.6;
+  const HEDGE_FASTER = 1.5;
+  // Queue classes, served in this order: the startup probe and init/index, then startup
+  // pieces, then everything else. A class never waits behind a lower one.
+  const QUEUE_CRITICAL = 0, QUEUE_STARTUP = 1, QUEUE_ORDINARY = 2;
+  // Priority an ordinary request with a playback deadline gains per millisecond of waiting:
+  // 20 (a hedge copy's boost) in 0.9 s.
+  const QUEUE_AGING_PER_MS = 20 / 900;
   // A shorter transfer is mostly round trip. The tail of a resumed piece can be a few KiB,
   // and counting it would mark down the very node that came to the rescue.
   const SPEED_SAMPLE_MIN_BYTES = 48 * 1024;
@@ -38,16 +51,26 @@
       while (this.active < this.limit && this.queue.length) {
         const now = performance.now();
         const urgency = entry => {
-          if (!Number.isFinite(entry.deadlineAt)) return 0;
-          const remaining = entry.deadlineAt - now;
+          // Read again at every pass: the player's deadline moves with the playhead and the
+          // playback rate, and a queued piece may have become due while it waited.
+          const deadlineAt = entry.deadline ? entry.deadline() : entry.deadlineAt;
+          if (!Number.isFinite(deadlineAt)) return 0;
+          const remaining = deadlineAt - now;
           if (remaining <= 0) return 12;
           if (remaining <= 750) return 9;
           if (remaining <= 2000) return 6;
           return 0;
         };
         // A bounded, recomputed boost prevents overdue primaries from sitting behind
-        // prefetch work without turning the queue back into strict deadline ordering.
-        this.queue.sort((a, b) => (b.priority + urgency(b)) - (a.priority + urgency(a))
+        // prefetch work without turning the queue back into strict deadline ordering. A
+        // request with a deadline also gains priority while it waits, so a piece queued long
+        // ago is not passed over again and again by newer ones of a slightly higher priority;
+        // requests without one (compatibility mode, the desktop client) keep the fixed order.
+        // Sorting inside the class keeps the startup probe, init and index, and then the
+        // startup pieces, ahead of ordinary media whatever the boosts add up to.
+        const rank = entry => entry.priority + urgency(entry)
+          + (entry.ages ? (now - entry.queuedAt) * QUEUE_AGING_PER_MS : 0);
+        this.queue.sort((a, b) => a.queueClass - b.queueClass || rank(b) - rank(a)
           || a.sequence - b.sequence);
         const entry = this.queue.shift();
         entry.signal?.removeEventListener("abort", entry.cancel);
@@ -65,7 +88,9 @@
       }
     }
 
-    acquire(signal, priority = 0, deadlineAt = Infinity) {
+    // deadline: a function giving the clock time playback needs this request, or null; the
+    // fixed deadlineAt is what callers without one pass.
+    acquire(signal, priority = 0, deadlineAt = Infinity, queueClass = QUEUE_CRITICAL, ages = false, deadline = null) {
       if (signal?.aborted) return Promise.reject(abortError(signal.reason));
       return new Promise((resolve, reject) => {
         const entry = {
@@ -75,6 +100,10 @@
           released: false,
           priority: Number(priority) || 0,
           deadlineAt: Number.isFinite(deadlineAt) ? deadlineAt : Infinity,
+          deadline,
+          queueClass,
+          ages,
+          queuedAt: performance.now(),
           sequence: this.sequence++
         };
         entry.cancel = () => {
@@ -356,13 +385,80 @@
         : settings.hedgeDelayMs;
     }
 
-    // Only measured per-request progress can spend this bounded rescue budget.
+    // Whether the second copy of a piece with a playback deadline should start now. Checked
+    // every 50 ms once the first copy holds a connection (a copy of a request still queued
+    // would only queue as well, and with its higher priority take the connection meant for
+    // it). first: the first copy (when it started, bytes received, bytes asked for); the delay
+    // counts from its start. copyBps: the measured speed of the copy's node, 0 when unknown.
+    // - No data yet, or nothing new for a whole delay (stopped): copy.
+    // - A deadline it meets with time to spare at its speed so far: no copy yet, the bandwidth
+    //   goes to pieces needed sooner.
+    // - The copy's node known to be clearly faster: copy.
+    // - Slower than connections usually are: copy.
+    // - On pace: a copy on a node known to be no faster only takes the next piece's connection
+    //   and bandwidth; one on a node not measured yet is tried, as the chance of a faster one.
+    //   A piece that will miss its deadline even so may spend one of the range's rescue slots
+    //   on that node anyway: its measurement can be stale (a node that was slow a minute ago
+    //   may have recovered), and waiting for the request to time out costs far more.
+    function hedgeDue(first, delayMs, deadlineAt, copyBps, rescue) {
+      const now = performance.now(), ran = now - first.startedAt;
+      const got = first.recorder.bytes;
+      if (got !== first.seenBytes) {
+        first.seenBytes = got;
+        first.seenAt = now;
+      }
+      if (ran < delayMs) return false;
+      if (!got || now - first.seenAt >= delayMs) return true;
+      const rate = got * 1000 / ran;
+      if (now + Math.max(0, first.length - got) * 1000 / rate <= deadlineAt - HEDGE_SLACK_MS) return false;
+      if (copyBps > rate * HEDGE_FASTER) return true;
+      if (!(meter.connectionBps > 0) || rate < meter.connectionBps * HEDGE_PACE) return true;
+      if (!(copyBps > 0)) return true;
+      return now + Math.max(0, first.length - got) * 1000 / rate > deadlineAt
+        && Boolean(rescue?.claimStale?.());
+    }
+
+    // When playback needs a range, as a clock time; Infinity when the caller did not say.
+    // options.deadlineAt is that time, options.deadlineMs the time left; either can be a
+    // function, read again at every check, so a new playback rate or position also moves the
+    // deadline of pieces already on their way.
+    function deadlineOf(options) {
+      const read = (value, relative) => {
+        const ms = Number(value);
+        if (value == null || !Number.isFinite(ms)) return Infinity;
+        return relative ? performance.now() + Math.max(0, ms) : ms;
+      };
+      const live = (value, relative) => () => {
+        try { return read(value(), relative); } catch (_error) { return Infinity; }
+      };
+      if (typeof options.deadlineAt === "function") return live(options.deadlineAt, false);
+      if (options.deadlineAt != null && Number.isFinite(Number(options.deadlineAt))) {
+        const fixed = Number(options.deadlineAt);
+        return () => fixed;
+      }
+      if (typeof options.deadlineMs === "function") return live(options.deadlineMs, true);
+      const fixed = read(options.deadlineMs, true);
+      return () => fixed;
+    }
+
+    // Only measured per-request progress can spend this bounded rescue budget. The second
+    // budget is for pieces that will miss their deadline while their copy's node is measured
+    // as no faster: that measurement can be stale, and a bounded number of such copies per
+    // range is far cheaper than waiting for a timeout.
     function createEarlyHedge(limit) {
       return {
         progressRemaining: Math.max(0, limit),
         claimProgress() {
           if (this.progressRemaining <= 0) return false;
           this.progressRemaining -= 1;
+          return true;
+        },
+        // At least one per range, even where no connection is held back (a single-piece
+        // download): one request is much cheaper than waiting out a timeout.
+        staleRemaining: Math.max(1, limit),
+        claimStale() {
+          if (this.staleRemaining <= 0) return false;
+          this.staleRemaining -= 1;
           return true;
         }
       };
@@ -425,9 +521,11 @@
     // A copy that waited in the queue resumes from what the first copy has received by then,
     // not from what it had when the copy was queued.
     async function attempt(piece, url, signal, kind, resolver, priority = 0, begin = null,
-      deadlineAt = Infinity, observeProgress = null) {
+      deadline = null, observeProgress = null, queueClass = QUEUE_CRITICAL) {
       const settings = config();
-      const release = await semaphore.acquire(signal, priority, deadlineAt);
+      const deadlineAt = deadline ? deadline() : Infinity;
+      const release = await semaphore.acquire(signal, priority, deadlineAt, queueClass,
+        queueClass === QUEUE_ORDINARY && Number.isFinite(deadlineAt), deadline);
       let received = { bytes: 0, chunks: [] };
       if (begin) {
         try {
@@ -559,7 +657,9 @@
     }
 
     async function downloadPiece(piece, resolver, signal, kind, preferredUrls, startupMode = false, priority = 0,
-      deadlineAt = Infinity, earlyHedge = null) {
+      deadline = null, earlyHedge = null) {
+      const hasDeadline = Boolean(deadline) && Number.isFinite(deadline());
+      const deadlineNow = () => (deadline ? deadline() : Infinity);
       const settings = config();
       const allowed = (url) => typeof resolver.allows !== "function" || resolver.allows(url);
       const startup = startupMode === true || startupMode === "probe";
@@ -614,12 +714,11 @@
           // for the rest of the hedge delay.
           let firstFailed = () => {};
           const firstFailure = new Promise((resolve) => { firstFailed = resolve; });
-          let firstStarted = () => {};
-          const firstStart = new Promise((resolve) => { firstStarted = resolve; });
           let firstStartedAt = 0, deadlineDeficitSamples = 0, firstBecameStraggler = () => {};
           const firstStraggler = new Promise((resolve) => { firstBecameStraggler = resolve; });
           const observeFirst = event => {
-            if (event.phase !== "progress" || !Number.isFinite(event.etaMs)) return;
+            if (!hasDeadline || event.phase !== "progress" || !Number.isFinite(event.etaMs)) return;
+            const deadlineAt = deadlineNow();
             const missesDeadline = Number.isFinite(deadlineAt)
               && event.etaMs >= Math.max(0, deadlineAt - performance.now());
             const slowerThanPeers = meter.connectionBps > 0 && event.bps < meter.connectionBps * 0.5
@@ -647,18 +746,21 @@
                 controllers[pairIndex].signal.removeEventListener("abort", canceled);
                 operation();
               };
-              const startTimer = () => {
-                const measured = hedgeDelayMs(settings);
-                const delay = probe ? 0 : startup
-                  ? Math.min(Number.isFinite(deadlineAt) ? 200 : 250, measured)
-                  : measured;
-                timer = setTimeout(() => finish(resolve), delay);
+              const measured = hedgeDelayMs(settings);
+              const delay = probe ? 0 : startup
+                ? Math.min(hasDeadline ? 200 : 250, measured)
+                : measured;
+              const copyBps = () => (typeof resolver.speed === "function" ? resolver.speed(url) || 0 : 0);
+              // A playback-deadline request decides once its first copy has a connection (see
+              // hedgeDue); one without a deadline (compatibility mode, the desktop client)
+              // keeps main's delay from the moment the piece asked, queue time included.
+              const check = () => {
+                if (settled) return;
+                if (contexts[0] && hedgeDue(contexts[0], delay, deadlineNow(), copyBps(), earlyHedge)) return finish(resolve);
+                timer = setTimeout(check, 50);
               };
-              // Playback-deadline requests start the hedge clock after the primary
-              // acquires a slot; legacy no-deadline downloads retain main's queue-time
-              // hedge behaviour for compatibility throughput.
-              if (Number.isFinite(deadlineAt)) firstStart.then(startTimer);
-              else startTimer();
+              if (hasDeadline && !probe) timer = setTimeout(check, 0);
+              else timer = setTimeout(() => finish(resolve), delay);
               firstStraggler.then(() => {
                 if (settled || probe || earlyClaimed || !earlyHedge?.claimProgress?.()) return;
                 earlyClaimed = true;
@@ -678,17 +780,15 @@
             let base = null;
             const recorder = { bytes: 0, chunks: [] };
             const begin = () => {
-              if (!pairIndex) {
-                firstStartedAt = performance.now();
-                firstStarted();
-              }
+              if (!pairIndex) firstStartedAt = performance.now();
               base = prefix && prefix.bytes >= RESUME_MIN_BYTES ? prefix : null;
               if (pairIndex) {
                 const live = liveProgress(contexts[0]);
                 if (live && live.bytes >= RESUME_MIN_BYTES && live.bytes > (base?.bytes || 0)) base = live;
               }
               if (base && base.bytes >= piece.length) base = null;
-              contexts[pairIndex] = { base, recorder };
+              const startedAt = performance.now();
+              contexts[pairIndex] = { base, recorder, startedAt, seenBytes: 0, seenAt: startedAt, length: piece.length - (base?.bytes || 0) };
               return {
                 recorder,
                 part: base
@@ -698,7 +798,8 @@
             };
             try {
               const result = await attempt(piece, url, controllers[pairIndex].signal, kind, resolver,
-                priority + (pairIndex ? 20 : 0), begin, deadlineAt, pairIndex ? null : observeFirst);
+                priority + (pairIndex ? 20 : 0), begin, deadline, pairIndex ? null : observeFirst,
+                probe ? QUEUE_CRITICAL : startup ? QUEUE_STARTUP : QUEUE_ORDINARY);
               return base
                 ? { bytes: core.concatChunks([...base.chunks, result.bytes], piece.length), total: result.total, url: result.url }
                 : result;
@@ -899,7 +1000,7 @@
         candidateUrls,
         "probe",
         220,
-        options.deadlineAt
+        options.deadline
       );
       await options.onOrderedChunk(headResult.bytes, head, headResult.total);
       if (head.end >= range.end) {
@@ -958,7 +1059,7 @@
           preferredFor(primaries[orderedIndex], [headResult.url, ...candidateUrls.filter((url) => url !== headResult.url)]),
           true,
           120 - Math.min(30, piece.index),
-          options.deadlineAt,
+          options.deadline,
           earlyHedge
         );
         ordered[orderedIndex] = result;
@@ -983,16 +1084,12 @@
     async function downloadRange(range, resolver, options = {}) {
       const settings = config();
       if (options.kind === "meta") return downloadStartupRange(range, resolver, options);
-      // Resolve one absolute deadline at the range boundary. Every piece, including work
+      // One deadline for the whole range, resolved at its boundary: every piece, including work
       // scheduled after the startup probe, refers to the same playback instant.
-      const deadlineAt = Number.isFinite(Number(options.deadlineAt))
-        ? Number(options.deadlineAt)
-        : Number.isFinite(Number(options.deadlineMs))
-          ? performance.now() + Math.max(0, Number(options.deadlineMs))
-          : Infinity;
+      const deadline = deadlineOf(options);
       const parallel = options.parallel !== false;
       if (options.startup === true && parallel && typeof options.onOrderedChunk === "function") {
-        return downloadStartupMediaRange(range, resolver, { ...options, deadlineAt }, settings);
+        return downloadStartupMediaRange(range, resolver, { ...options, deadline }, settings);
       }
       const preferredUrls = parallel && typeof resolver.rangeCandidates === "function"
         ? resolver.rangeCandidates()
@@ -1044,7 +1141,7 @@
           preferredFor(primaries[piece.index], preferredUrls),
           options.startup === true,
           basePriority - Math.min(20, piece.index),
-          deadlineAt,
+          deadline,
           earlyHedge
         );
         if (progressive) {
